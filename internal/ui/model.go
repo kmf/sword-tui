@@ -45,6 +45,8 @@ type Model struct {
 	showSidebar            bool
 	showTranslationList    bool
 	translationSelected    int
+	currentVerses          []api.Verse
+	currentParallelVerses  map[string][]api.Verse
 }
 
 type errMsg struct{ err error }
@@ -371,6 +373,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.viewport.Width = msg.Width
 			m.viewport.Height = msg.Height - 6
 		}
+
+		// Reformat content with new width
+		if m.currentVerses != nil {
+			m.content = formatChapter(m.currentVerses, m.currentBookName, m.currentChapter, m.width)
+		} else if m.currentParallelVerses != nil {
+			m.content = formatParallelVerses(m.currentParallelVerses, m.comparisonTranslations, m.currentBookName, m.currentChapter, m.width)
+		}
 		m.viewport.SetContent(m.content)
 
 	case translationsLoadedMsg:
@@ -387,13 +396,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case chapterLoadedMsg:
 		m.loading = false
-		m.content = formatChapter(msg.verses, m.currentBookName, m.currentChapter)
+		m.currentVerses = msg.verses
+		m.currentParallelVerses = nil
+		m.content = formatChapter(msg.verses, m.currentBookName, m.currentChapter, m.width)
 		m.viewport.SetContent(m.content)
 		m.viewport.GotoTop()
 
 	case parallelVersesLoadedMsg:
 		m.loading = false
-		m.content = formatParallelVerses(msg.verses, m.comparisonTranslations, m.currentBookName, m.currentChapter)
+		m.currentParallelVerses = msg.verses
+		m.currentVerses = nil
+		m.content = formatParallelVerses(msg.verses, m.comparisonTranslations, m.currentBookName, m.currentChapter, m.width)
 		m.viewport.SetContent(m.content)
 		m.viewport.GotoTop()
 
@@ -603,7 +616,7 @@ func (m Model) renderTranslationList() string {
 	return listStyle.Render(sb.String())
 }
 
-func formatChapter(verses []api.Verse, bookName string, chapter int) string {
+func formatChapter(verses []api.Verse, bookName string, chapter int, width int) string {
 	verseStyle := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("147"))
 
@@ -612,18 +625,66 @@ func formatChapter(verses []api.Verse, bookName string, chapter int) string {
 
 	var sb strings.Builder
 
+	// Calculate available width for text (accounting for verse number and spacing)
+	textWidth := width - 10 // Reserve space for verse number and padding
+	if textWidth < 40 {
+		textWidth = 40 // Minimum width
+	}
+
 	for _, v := range verses {
 		// Remove HTML tags
 		text := stripHTMLTags(v.Text)
 		verseNum := verseStyle.Render(fmt.Sprintf("%d", v.Verse))
-		verseText := textStyle.Render(text)
+
+		// Wrap text to available width
+		wrappedText := wrapText(text, textWidth)
+		verseText := textStyle.Render(wrappedText)
 		sb.WriteString(fmt.Sprintf("%s  %s\n\n", verseNum, verseText))
 	}
 
 	return sb.String()
 }
 
-func formatParallelVerses(versesMap map[string][]api.Verse, translations []string, bookName string, chapter int) string {
+func wrapText(text string, width int) string {
+	if width <= 0 {
+		return text
+	}
+
+	var result strings.Builder
+	var currentLine strings.Builder
+	currentLength := 0
+
+	words := strings.Fields(text)
+	for i, word := range words {
+		wordLen := len(word)
+
+		// If adding this word would exceed width, start a new line
+		if currentLength > 0 && currentLength+1+wordLen > width {
+			result.WriteString(currentLine.String())
+			result.WriteString("\n")
+			currentLine.Reset()
+			currentLength = 0
+		}
+
+		// Add space before word (except at start of line)
+		if currentLength > 0 {
+			currentLine.WriteString(" ")
+			currentLength++
+		}
+
+		currentLine.WriteString(word)
+		currentLength += wordLen
+
+		// If this is the last word, write it out
+		if i == len(words)-1 {
+			result.WriteString(currentLine.String())
+		}
+	}
+
+	return result.String()
+}
+
+func formatParallelVerses(versesMap map[string][]api.Verse, translations []string, bookName string, chapter int, width int) string {
 	translationStyle := lipgloss.NewStyle().
 		Bold(true).
 		Foreground(lipgloss.Color("205"))
@@ -637,6 +698,12 @@ func formatParallelVerses(versesMap map[string][]api.Verse, translations []strin
 
 	var sb strings.Builder
 
+	// Calculate available width for text (accounting for translation label)
+	textWidth := width - 15 // Reserve space for [TRANS] label and padding
+	if textWidth < 40 {
+		textWidth = 40 // Minimum width
+	}
+
 	// Get max verses from any translation
 	maxVerses := 0
 	for _, verses := range versesMap {
@@ -648,7 +715,11 @@ func formatParallelVerses(versesMap map[string][]api.Verse, translations []strin
 	// Display verse by verse across translations
 	for i := 1; i <= maxVerses; i++ {
 		sb.WriteString(verseNumStyle.Render(fmt.Sprintf("Verse %d", i)) + "\n")
-		sb.WriteString(strings.Repeat("─", 80) + "\n")
+		separatorWidth := width
+		if separatorWidth > 80 {
+			separatorWidth = 80
+		}
+		sb.WriteString(strings.Repeat("─", separatorWidth) + "\n")
 
 		for _, trans := range translations {
 			verses, ok := versesMap[trans]
@@ -659,8 +730,9 @@ func formatParallelVerses(versesMap map[string][]api.Verse, translations []strin
 			for _, v := range verses {
 				if v.Verse == i {
 					text := stripHTMLTags(v.Text)
+					wrappedText := wrapText(text, textWidth)
 					transLabel := translationStyle.Render(fmt.Sprintf("[%s]", trans))
-					verseText := textStyle.Render(text)
+					verseText := textStyle.Render(wrappedText)
 					sb.WriteString(fmt.Sprintf("%s %s\n\n", transLabel, verseText))
 					break
 				}
