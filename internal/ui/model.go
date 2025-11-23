@@ -20,6 +20,7 @@ const (
 	modeSearch
 	modeComparison
 	modeTranslationSelect
+	modeSidebar
 )
 
 type Model struct {
@@ -40,6 +41,8 @@ type Model struct {
 	err                 error
 	loading             bool
 	comparisonTranslations []string
+	sidebarSelected     int
+	showSidebar         bool
 }
 
 type errMsg struct{ err error }
@@ -132,14 +135,35 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "ctrl+c", "q":
 			return m, tea.Quit
-		case "/":
+		case "[":
 			if m.mode == modeReader {
+				m.showSidebar = true
+				m.sidebarSelected = m.currentBook - 1
+				return m, nil
+			}
+		case "]":
+			if m.showSidebar {
+				m.showSidebar = false
+				return m, nil
+			}
+		case "/":
+			if m.mode == modeReader && !m.showSidebar {
 				m.mode = modeSearch
 				m.textInput.Focus()
 				return m, nil
 			}
+		case "up", "k":
+			if m.showSidebar && m.sidebarSelected > 0 {
+				m.sidebarSelected--
+				return m, nil
+			}
+		case "down", "j":
+			if m.showSidebar && m.books != nil && m.sidebarSelected < len(m.books)-1 {
+				m.sidebarSelected++
+				return m, nil
+			}
 		case "c":
-			if m.mode == modeReader {
+			if m.mode == modeReader && !m.showSidebar {
 				m.mode = modeComparison
 				verses := []int{}
 				for i := 1; i <= 31; i++ {
@@ -153,7 +177,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case "t":
-			if m.mode == modeReader {
+			if m.mode == modeReader && !m.showSidebar {
 				m.mode = modeTranslationSelect
 				return m, nil
 			}
@@ -176,7 +200,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, loadChapter(m.client, m.selectedTranslation, m.currentBook, m.currentChapter)
 			}
 		case "enter":
-			if m.mode == modeSearch {
+			if m.showSidebar && m.books != nil {
+				// Select book from sidebar
+				if m.sidebarSelected < len(m.books) {
+					m.currentBook = m.books[m.sidebarSelected].BookID
+					m.currentBookName = m.books[m.sidebarSelected].Name
+					m.currentChapter = 1
+					m.showSidebar = false
+					m.loading = true
+					return m, loadChapter(m.client, m.selectedTranslation, m.currentBook, m.currentChapter)
+				}
+			} else if m.mode == modeSearch {
 				input := m.textInput.Value()
 				book, chapter, verse, err := parseReference(input)
 				if err == nil {
@@ -208,6 +242,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				)
 			}
 		case "esc":
+			if m.showSidebar {
+				m.showSidebar = false
+				return m, nil
+			}
 			if m.mode == modeSearch || m.mode == modeTranslationSelect {
 				m.mode = modeReader
 				return m, nil
@@ -306,8 +344,10 @@ func (m Model) View() string {
 	var help string
 	if m.loading {
 		help = helpStyle.Render("Loading...")
+	} else if m.showSidebar {
+		help = helpStyle.Render("↑/↓ or j/k: navigate | enter: select | ]/esc: close")
 	} else {
-		help = helpStyle.Render("/: search | c: compare | t: translation | n: next | p: prev | q: quit")
+		help = helpStyle.Render("[: books | /: search | c: compare | t: translation | n: next | p: prev | q: quit")
 	}
 
 	var errorMsg string
@@ -315,7 +355,66 @@ func (m Model) View() string {
 		errorMsg = "\n" + errorStyle.Render(fmt.Sprintf("Error: %v", m.err))
 	}
 
+	if m.showSidebar {
+		sidebar := m.renderSidebar()
+		mainContent := fmt.Sprintf("%s\n%s\n%s%s", header, m.viewport.View(), help, errorMsg)
+		return lipgloss.JoinHorizontal(lipgloss.Top, sidebar, mainContent)
+	}
+
 	return fmt.Sprintf("%s\n%s\n%s%s", header, m.viewport.View(), help, errorMsg)
+}
+
+func (m Model) renderSidebar() string {
+	sidebarStyle := lipgloss.NewStyle().
+		Width(30).
+		Height(m.height - 2).
+		Border(lipgloss.NormalBorder()).
+		BorderForeground(lipgloss.Color("240")).
+		Padding(1)
+
+	selectedStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("205")).
+		Bold(true)
+
+	normalStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("252"))
+
+	oldTestamentStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("86")).
+		Bold(true)
+
+	var sb strings.Builder
+	sb.WriteString(oldTestamentStyle.Render("OLD TESTAMENT") + "\n\n")
+
+	if m.books != nil {
+		// Old Testament (books 1-39)
+		for i, book := range m.books {
+			if book.BookID > 39 {
+				break
+			}
+			if i == m.sidebarSelected {
+				sb.WriteString(selectedStyle.Render("> "+book.Name) + "\n")
+			} else {
+				sb.WriteString(normalStyle.Render("  "+book.Name) + "\n")
+			}
+		}
+
+		sb.WriteString("\n" + oldTestamentStyle.Render("NEW TESTAMENT") + "\n\n")
+
+		// New Testament (books 40-66)
+		for i, book := range m.books {
+			if book.BookID < 40 {
+				continue
+			}
+			if i == m.sidebarSelected {
+				sb.WriteString(selectedStyle.Render("> "+book.Name) + "\n")
+			} else {
+				sb.WriteString(normalStyle.Render("  "+book.Name) + "\n")
+			}
+		}
+	}
+
+	return sidebarStyle.Render(sb.String())
 }
 
 func formatChapter(verses []api.Verse, bookName string, chapter int) string {
