@@ -1,5 +1,5 @@
 # Binaries
-sword-tui
+/sword-tui
 *.exe
 *.exe~
 *.dll
