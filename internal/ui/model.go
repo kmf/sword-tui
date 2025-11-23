@@ -146,8 +146,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case "]":
-			if m.showSidebar {
-				m.showSidebar = false
+			if m.mode == modeReader && !m.showSidebar {
+				m.showTranslationList = !m.showTranslationList
+				if m.showTranslationList && m.translations != nil {
+					// Find current translation index
+					for i, trans := range m.translations {
+						if trans.ShortName == m.selectedTranslation {
+							m.translationSelected = i
+							break
+						}
+					}
+				}
 				return m, nil
 			}
 		case "/":
@@ -187,17 +196,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case "t":
-			if m.mode == modeReader && !m.showSidebar {
-				m.showTranslationList = !m.showTranslationList
-				if m.showTranslationList && m.translations != nil {
-					// Find current translation index
-					for i, trans := range m.translations {
-						if trans.ShortName == m.selectedTranslation {
-							m.translationSelected = i
-							break
-						}
-					}
-				}
+			if m.mode == modeReader && !m.showSidebar && !m.showTranslationList {
+				m.mode = modeTranslationSelect
 				return m, nil
 			}
 		case "n":
@@ -446,11 +446,11 @@ func (m Model) View() string {
 	if m.loading {
 		help = helpStyle.Render("Loading...")
 	} else if m.showTranslationList {
-		help = helpStyle.Render("↑/↓ or j/k: navigate | enter: select | esc: close")
-	} else if m.showSidebar {
 		help = helpStyle.Render("↑/↓ or j/k: navigate | enter: select | ]/esc: close")
+	} else if m.showSidebar {
+		help = helpStyle.Render("↑/↓ or j/k: navigate | enter: select | [/esc: close")
 	} else {
-		help = helpStyle.Render("[: books | /: search | c: compare | t: translation | n: next | p: prev | q: quit")
+		help = helpStyle.Render("[: books | ]: translations | /: search | c: compare | n: next | p: prev | q: quit")
 	}
 
 	var errorMsg string
