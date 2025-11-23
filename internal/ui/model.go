@@ -60,12 +60,12 @@ func NewModel() Model {
 	return Model{
 		client:              api.NewClient(),
 		textInput:           ti,
-		selectedTranslation: "KJV",
+		selectedTranslation: "NLT",
 		currentBook:         1,
 		currentChapter:      1,
 		currentBookName:     "Genesis",
 		mode:                modeReader,
-		comparisonTranslations: []string{"KJV", "ASV", "WEB"},
+		comparisonTranslations: []string{"NLT", "KJV", "WEB"},
 	}
 }
 
@@ -193,7 +193,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			} else if m.mode == modeTranslationSelect {
 				// Simple translation selection (cycle through common ones)
-				translations := []string{"KJV", "ASV", "WEB", "YLT", "DARBY"}
+				translations := []string{"NLT", "KJV", "ASV", "WEB", "YLT", "DARBY"}
 				for i, t := range translations {
 					if t == m.selectedTranslation {
 						m.selectedTranslation = translations[(i+1)%len(translations)]
