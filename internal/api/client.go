@@ -28,7 +28,7 @@ type Translation struct {
 }
 
 type Book struct {
-	BookID     string `json:"bookid"`
+	BookID     int    `json:"bookid"`
 	ChronOrder int    `json:"chronorder"`
 	Name       string `json:"name"`
 	Chapters   []int  `json:"chapters"`

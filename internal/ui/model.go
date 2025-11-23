@@ -160,7 +160,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "n":
 			if m.mode == modeReader && m.books != nil {
 				for _, book := range m.books {
-					if book.BookID == strconv.Itoa(m.currentBook) {
+					if book.BookID == m.currentBook {
 						if m.currentChapter < len(book.Chapters) {
 							m.currentChapter++
 							m.loading = true
@@ -234,7 +234,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case booksLoadedMsg:
 		m.books = msg.books
 		for _, book := range m.books {
-			if book.BookID == strconv.Itoa(m.currentBook) {
+			if book.BookID == m.currentBook {
 				m.currentBookName = book.Name
 				break
 			}
