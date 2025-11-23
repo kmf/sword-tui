@@ -24,25 +24,27 @@ const (
 )
 
 type Model struct {
-	client              *api.Client
-	viewport            viewport.Model
-	textInput           textinput.Model
-	translations        []api.Translation
-	selectedTranslation string
-	currentBook         int
-	currentChapter      int
-	currentBookName     string
-	books               []api.Book
-	content             string
-	mode                viewMode
-	width               int
-	height              int
-	ready               bool
-	err                 error
-	loading             bool
+	client                 *api.Client
+	viewport               viewport.Model
+	textInput              textinput.Model
+	translations           []api.Translation
+	selectedTranslation    string
+	currentBook            int
+	currentChapter         int
+	currentBookName        string
+	books                  []api.Book
+	content                string
+	mode                   viewMode
+	width                  int
+	height                 int
+	ready                  bool
+	err                    error
+	loading                bool
 	comparisonTranslations []string
-	sidebarSelected     int
-	showSidebar         bool
+	sidebarSelected        int
+	showSidebar            bool
+	showTranslationList    bool
+	translationSelected    int
 }
 
 type errMsg struct{ err error }
@@ -155,12 +157,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case "up", "k":
-			if m.showSidebar && m.sidebarSelected > 0 {
+			if m.showTranslationList && m.translationSelected > 0 {
+				m.translationSelected--
+				return m, nil
+			} else if m.showSidebar && m.sidebarSelected > 0 {
 				m.sidebarSelected--
 				return m, nil
 			}
 		case "down", "j":
-			if m.showSidebar && m.books != nil && m.sidebarSelected < len(m.books)-1 {
+			if m.showTranslationList && m.translations != nil && m.translationSelected < len(m.translations)-1 {
+				m.translationSelected++
+				return m, nil
+			} else if m.showSidebar && m.books != nil && m.sidebarSelected < len(m.books)-1 {
 				m.sidebarSelected++
 				return m, nil
 			}
@@ -180,7 +188,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "t":
 			if m.mode == modeReader && !m.showSidebar {
-				m.mode = modeTranslationSelect
+				m.showTranslationList = !m.showTranslationList
+				if m.showTranslationList && m.translations != nil {
+					// Find current translation index
+					for i, trans := range m.translations {
+						if trans.ShortName == m.selectedTranslation {
+							m.translationSelected = i
+							break
+						}
+					}
+				}
 				return m, nil
 			}
 		case "n":
@@ -202,7 +219,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, loadChapter(m.client, m.selectedTranslation, m.currentBook, m.currentChapter)
 			}
 		case "enter":
-			if m.showSidebar && m.books != nil {
+			if m.showTranslationList && m.translations != nil {
+				// Select translation from list
+				if m.translationSelected < len(m.translations) {
+					m.selectedTranslation = m.translations[m.translationSelected].ShortName
+					m.showTranslationList = false
+					m.loading = true
+					return m, tea.Batch(
+						loadBooks(m.client, m.selectedTranslation),
+						loadChapter(m.client, m.selectedTranslation, m.currentBook, m.currentChapter),
+					)
+				}
+			} else if m.showSidebar && m.books != nil {
 				// Select book from sidebar
 				if m.sidebarSelected < len(m.books) {
 					m.currentBook = m.books[m.sidebarSelected].BookID
@@ -244,6 +272,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				)
 			}
 		case "esc":
+			if m.showTranslationList {
+				m.showTranslationList = false
+				return m, nil
+			}
 			if m.showSidebar {
 				m.showSidebar = false
 				return m, nil
@@ -413,6 +445,8 @@ func (m Model) View() string {
 	var help string
 	if m.loading {
 		help = helpStyle.Render("Loading...")
+	} else if m.showTranslationList {
+		help = helpStyle.Render("↑/↓ or j/k: navigate | enter: select | esc: close")
 	} else if m.showSidebar {
 		help = helpStyle.Render("↑/↓ or j/k: navigate | enter: select | ]/esc: close")
 	} else {
@@ -422,6 +456,12 @@ func (m Model) View() string {
 	var errorMsg string
 	if m.err != nil {
 		errorMsg = "\n" + errorStyle.Render(fmt.Sprintf("Error: %v", m.err))
+	}
+
+	if m.showTranslationList {
+		translationList := m.renderTranslationList()
+		mainContent := fmt.Sprintf("%s\n%s\n%s%s", header, m.viewport.View(), help, errorMsg)
+		return lipgloss.JoinHorizontal(lipgloss.Top, mainContent, translationList)
 	}
 
 	if m.showSidebar {
@@ -484,6 +524,46 @@ func (m Model) renderSidebar() string {
 	}
 
 	return sidebarStyle.Render(sb.String())
+}
+
+func (m Model) renderTranslationList() string {
+	listStyle := lipgloss.NewStyle().
+		Width(40).
+		Height(m.height - 2).
+		Border(lipgloss.NormalBorder()).
+		BorderForeground(lipgloss.Color("240")).
+		Padding(1)
+
+	selectedStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("205")).
+		Bold(true)
+
+	normalStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("252"))
+
+	headerStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("86")).
+		Bold(true)
+
+	var sb strings.Builder
+	sb.WriteString(headerStyle.Render("TRANSLATIONS") + "\n\n")
+
+	if m.translations != nil {
+		for i, trans := range m.translations {
+			displayName := fmt.Sprintf("%s - %s", trans.ShortName, trans.FullName)
+			if len(displayName) > 36 {
+				displayName = displayName[:33] + "..."
+			}
+
+			if i == m.translationSelected {
+				sb.WriteString(selectedStyle.Render("> "+displayName) + "\n")
+			} else {
+				sb.WriteString(normalStyle.Render("  "+displayName) + "\n")
+			}
+		}
+	}
+
+	return listStyle.Render(sb.String())
 }
 
 func formatChapter(verses []api.Verse, bookName string, chapter int) string {
