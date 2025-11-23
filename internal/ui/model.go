@@ -137,8 +137,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		case "[":
 			if m.mode == modeReader {
-				m.showSidebar = true
-				m.sidebarSelected = m.currentBook - 1
+				m.showSidebar = !m.showSidebar
+				if m.showSidebar {
+					m.sidebarSelected = m.currentBook - 1
+				}
 				return m, nil
 			}
 		case "]":
