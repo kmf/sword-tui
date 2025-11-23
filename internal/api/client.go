@@ -72,13 +72,16 @@ func (c *Client) GetTranslations() ([]Translation, error) {
 		return nil, err
 	}
 
-	// Flatten all translations from all language groups into a single list
-	var allTranslations []Translation
+	// Filter for English translations only
+	var englishTranslations []Translation
 	for _, group := range languageGroups {
-		allTranslations = append(allTranslations, group.Translations...)
+		if group.Language == "English" {
+			englishTranslations = group.Translations
+			break
+		}
 	}
 
-	return allTranslations, nil
+	return englishTranslations, nil
 }
 
 func (c *Client) GetBooks(translation string) ([]Book, error) {
