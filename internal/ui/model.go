@@ -132,7 +132,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "ctrl+c", "q":
 			return m, tea.Quit
-		case "s":
+		case "/":
 			if m.mode == modeReader {
 				m.mode = modeSearch
 				m.textInput.Focus()
@@ -307,7 +307,7 @@ func (m Model) View() string {
 	if m.loading {
 		help = helpStyle.Render("Loading...")
 	} else {
-		help = helpStyle.Render("s: search | c: compare | t: translation | n: next | p: prev | q: quit")
+		help = helpStyle.Render("/: search | c: compare | t: translation | n: next | p: prev | q: quit")
 	}
 
 	var errorMsg string
