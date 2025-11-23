@@ -31,7 +31,7 @@ type Book struct {
 	BookID     int    `json:"bookid"`
 	ChronOrder int    `json:"chronorder"`
 	Name       string `json:"name"`
-	Chapters   []int  `json:"chapters"`
+	Chapters   int    `json:"chapters"`
 }
 
 type Verse struct {

@@ -161,7 +161,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.mode == modeReader && m.books != nil {
 				for _, book := range m.books {
 					if book.BookID == m.currentBook {
-						if m.currentChapter < len(book.Chapters) {
+						if m.currentChapter < book.Chapters {
 							m.currentChapter++
 							m.loading = true
 							return m, loadChapter(m.client, m.selectedTranslation, m.currentBook, m.currentChapter)
