@@ -140,13 +140,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "[":
 			if m.mode == modeReader {
 				m.showSidebar = !m.showSidebar
-				if m.showSidebar {
-					m.sidebarSelected = m.currentBook - 1
+				if m.showSidebar && m.books != nil {
+					// Find the index of the current book in the books array
+					for i, book := range m.books {
+						if book.BookID == m.currentBook {
+							m.sidebarSelected = i
+							break
+						}
+					}
 				}
 				return m, nil
 			}
 		case "]":
-			if m.mode == modeReader && !m.showSidebar {
+			if m.mode == modeReader {
 				m.showTranslationList = !m.showTranslationList
 				if m.showTranslationList && m.translations != nil {
 					// Find current translation index
