@@ -323,7 +323,8 @@ func formatChapter(verses []api.Verse, bookName string, chapter int) string {
 		Foreground(lipgloss.Color("147"))
 
 	textStyle := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("252"))
+		Foreground(lipgloss.Color("252")).
+		Width(80)
 
 	var sb strings.Builder
 
@@ -348,7 +349,8 @@ func formatParallelVerses(versesMap map[string][]api.Verse, translations []strin
 		Bold(true)
 
 	textStyle := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("252"))
+		Foreground(lipgloss.Color("252")).
+		Width(80)
 
 	var sb strings.Builder
 
