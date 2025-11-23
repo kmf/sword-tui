@@ -634,10 +634,14 @@ func formatChapter(verses []api.Verse, bookName string, chapter int, width int) 
 	for _, v := range verses {
 		// Remove HTML tags
 		text := stripHTMLTags(v.Text)
-		verseNum := verseStyle.Render(fmt.Sprintf("%d", v.Verse))
+		verseNumStr := fmt.Sprintf("%d", v.Verse)
+		verseNum := verseStyle.Render(verseNumStr)
+
+		// Calculate indent for wrapped lines (verse number length + 2 spaces)
+		indent := len(verseNumStr) + 2
 
 		// Wrap text to available width
-		wrappedText := wrapText(text, textWidth)
+		wrappedText := wrapTextWithIndent(text, textWidth, indent)
 		verseText := textStyle.Render(wrappedText)
 		sb.WriteString(fmt.Sprintf("%s  %s\n\n", verseNum, verseText))
 	}
@@ -668,6 +672,53 @@ func wrapText(text string, width int) string {
 
 		// Add space before word (except at start of line)
 		if currentLength > 0 {
+			currentLine.WriteString(" ")
+			currentLength++
+		}
+
+		currentLine.WriteString(word)
+		currentLength += wordLen
+
+		// If this is the last word, write it out
+		if i == len(words)-1 {
+			result.WriteString(currentLine.String())
+		}
+	}
+
+	return result.String()
+}
+
+func wrapTextWithIndent(text string, width int, indent int) string {
+	if width <= 0 {
+		return text
+	}
+
+	var result strings.Builder
+	var currentLine strings.Builder
+	currentLength := 0
+	isFirstLine := true
+
+	words := strings.Fields(text)
+	for i, word := range words {
+		wordLen := len(word)
+
+		// If adding this word would exceed width, start a new line
+		if currentLength > 0 && currentLength+1+wordLen > width {
+			result.WriteString(currentLine.String())
+			result.WriteString("\n")
+			currentLine.Reset()
+			currentLength = 0
+			isFirstLine = false
+		}
+
+		// Add indent for continuation lines
+		if currentLength == 0 && !isFirstLine {
+			currentLine.WriteString(strings.Repeat(" ", indent))
+			currentLength = indent
+		}
+
+		// Add space before word (except at start of line)
+		if currentLength > 0 && currentLength != indent {
 			currentLine.WriteString(" ")
 			currentLength++
 		}
@@ -730,8 +781,11 @@ func formatParallelVerses(versesMap map[string][]api.Verse, translations []strin
 			for _, v := range verses {
 				if v.Verse == i {
 					text := stripHTMLTags(v.Text)
-					wrappedText := wrapText(text, textWidth)
-					transLabel := translationStyle.Render(fmt.Sprintf("[%s]", trans))
+					transLabelStr := fmt.Sprintf("[%s]", trans)
+					// Calculate indent for wrapped lines (translation label length + 1 space)
+					indent := len(transLabelStr) + 1
+					wrappedText := wrapTextWithIndent(text, textWidth, indent)
+					transLabel := translationStyle.Render(transLabelStr)
 					verseText := textStyle.Render(wrappedText)
 					sb.WriteString(fmt.Sprintf("%s %s\n\n", transLabel, verseText))
 					break
