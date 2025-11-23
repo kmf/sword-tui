@@ -529,7 +529,7 @@ func (m Model) renderSidebar() string {
 func (m Model) renderTranslationList() string {
 	listStyle := lipgloss.NewStyle().
 		Width(40).
-		Height(m.height - 2).
+		MaxHeight(m.height - 2).
 		Border(lipgloss.NormalBorder()).
 		BorderForeground(lipgloss.Color("240")).
 		Padding(1)
@@ -548,8 +548,33 @@ func (m Model) renderTranslationList() string {
 	var sb strings.Builder
 	sb.WriteString(headerStyle.Render("TRANSLATIONS") + "\n\n")
 
-	if m.translations != nil {
-		for i, trans := range m.translations {
+	if m.translations != nil && len(m.translations) > 0 {
+		// Calculate visible window around selected item
+		visibleItems := m.height - 8 // Account for header, padding, borders
+		if visibleItems < 5 {
+			visibleItems = 5
+		}
+
+		startIdx := m.translationSelected - visibleItems/2
+		if startIdx < 0 {
+			startIdx = 0
+		}
+		endIdx := startIdx + visibleItems
+		if endIdx > len(m.translations) {
+			endIdx = len(m.translations)
+			startIdx = endIdx - visibleItems
+			if startIdx < 0 {
+				startIdx = 0
+			}
+		}
+
+		// Show position indicator
+		if startIdx > 0 {
+			sb.WriteString(normalStyle.Render(fmt.Sprintf("  ... (%d more above)\n", startIdx)))
+		}
+
+		for i := startIdx; i < endIdx && i < len(m.translations); i++ {
+			trans := m.translations[i]
 			displayName := fmt.Sprintf("%s - %s", trans.ShortName, trans.FullName)
 			if len(displayName) > 36 {
 				displayName = displayName[:33] + "..."
@@ -561,6 +586,12 @@ func (m Model) renderTranslationList() string {
 				sb.WriteString(normalStyle.Render("  "+displayName) + "\n")
 			}
 		}
+
+		if endIdx < len(m.translations) {
+			sb.WriteString(normalStyle.Render(fmt.Sprintf("  ... (%d more below)\n", len(m.translations)-endIdx)))
+		}
+	} else {
+		sb.WriteString(normalStyle.Render("  Loading translations..."))
 	}
 
 	return listStyle.Render(sb.String())
