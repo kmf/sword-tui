@@ -254,6 +254,73 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+	case tea.MouseMsg:
+		if m.showSidebar {
+			if msg.Type == tea.MouseLeft {
+				// Handle mouse clicks in sidebar
+				// Sidebar is 30 chars wide + 4 for border/padding
+				if msg.X < 34 {
+					// Calculate which book was clicked
+					// Account for header, padding, and section titles
+					clickY := msg.Y - 5 // Adjust for header and padding
+
+					if clickY >= 0 && m.books != nil {
+						bookIndex := 0
+						currentY := 0
+
+						// Skip "OLD TESTAMENT" header (2 lines)
+						if clickY < 2 {
+							return m, nil
+						}
+						currentY = 2
+
+						// Old Testament books
+						for i, book := range m.books {
+							if book.BookID > 39 {
+								break
+							}
+							if clickY == currentY {
+								bookIndex = i
+								m.sidebarSelected = bookIndex
+								m.currentBook = m.books[bookIndex].BookID
+								m.currentBookName = m.books[bookIndex].Name
+								m.currentChapter = 1
+								m.showSidebar = false
+								m.loading = true
+								return m, loadChapter(m.client, m.selectedTranslation, m.currentBook, m.currentChapter)
+							}
+							currentY++
+						}
+
+						// Skip "NEW TESTAMENT" header (2 lines)
+						currentY += 2
+
+						// New Testament books
+						for i, book := range m.books {
+							if book.BookID < 40 {
+								continue
+							}
+							if clickY == currentY {
+								bookIndex = i
+								m.sidebarSelected = bookIndex
+								m.currentBook = m.books[bookIndex].BookID
+								m.currentBookName = m.books[bookIndex].Name
+								m.currentChapter = 1
+								m.showSidebar = false
+								m.loading = true
+								return m, loadChapter(m.client, m.selectedTranslation, m.currentBook, m.currentChapter)
+							}
+							currentY++
+						}
+					}
+				}
+			}
+		} else {
+			// Pass mouse events to viewport for scrolling
+			m.viewport, cmd = m.viewport.Update(msg)
+			cmds = append(cmds, cmd)
+		}
+
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
