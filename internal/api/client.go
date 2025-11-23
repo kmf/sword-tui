@@ -23,8 +23,13 @@ func NewClient() *Client {
 type Translation struct {
 	ShortName string `json:"short_name"`
 	FullName  string `json:"full_name"`
-	Updated   string `json:"updated"`
+	Updated   int64  `json:"updated"`
 	Dir       string `json:"dir,omitempty"`
+}
+
+type LanguageGroup struct {
+	Language     string        `json:"language"`
+	Translations []Translation `json:"translations"`
 }
 
 type Book struct {
@@ -62,12 +67,18 @@ func (c *Client) GetTranslations() ([]Translation, error) {
 		return nil, fmt.Errorf("API returned status %d", resp.StatusCode)
 	}
 
-	var translations []Translation
-	if err := json.NewDecoder(resp.Body).Decode(&translations); err != nil {
+	var languageGroups []LanguageGroup
+	if err := json.NewDecoder(resp.Body).Decode(&languageGroups); err != nil {
 		return nil, err
 	}
 
-	return translations, nil
+	// Flatten all translations from all language groups into a single list
+	var allTranslations []Translation
+	for _, group := range languageGroups {
+		allTranslations = append(allTranslations, group.Translations...)
+	}
+
+	return allTranslations, nil
 }
 
 func (c *Client) GetBooks(translation string) ([]Book, error) {
