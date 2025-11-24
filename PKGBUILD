@@ -9,7 +9,7 @@ license=('GPL-2.0-or-later')
 depends=()
 makedepends=('go')
 source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/v${pkgver}.tar.gz")
-sha256sums=('SKIP')  # Generate with: makepkg -g
+sha256sums=('8b6ec9da2299f6f58ce44b32076287d0b90783a5259ce9b41a5b2a39f7fdd2d9')
 
 build() {
     cd "${pkgname}-${pkgver}"
