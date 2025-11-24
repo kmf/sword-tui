@@ -930,30 +930,49 @@ func (m Model) View() string {
 		header = headerStyle.Render(title)
 	}
 
+	// Create status bar with help and version
+	statusBarStyle := lipgloss.NewStyle().
+		Foreground(m.currentTheme.Muted).
+		BorderStyle(lipgloss.NormalBorder()).
+		BorderTop(true).
+		BorderForeground(m.currentTheme.Border)
+
 	versionStyle := lipgloss.NewStyle().
-		Foreground(m.currentTheme.Muted)
+		Foreground(m.currentTheme.Accent).
+		Bold(true)
 
 	// Format version string with build number
 	versionString := fmt.Sprintf("%s (build %s)", version.Version, version.BuildNumber)
 
-	var help string
+	var helpText string
 	if m.loading {
-		help = helpStyle.Render("Loading...") + " " + versionStyle.Render(versionString)
+		helpText = "Loading..."
 	} else if m.mode == modeTranslationSelect {
-		help = helpStyle.Render("↑/↓ or j/k: navigate | enter: select | esc: close") + " " + versionStyle.Render(versionString)
+		helpText = "↑/↓ or j/k: navigate | enter: select | esc: close"
 	} else if m.mode == modeThemeSelect {
-		help = helpStyle.Render("↑/↓ or j/k: navigate | enter: select | esc: close") + " " + versionStyle.Render(versionString)
+		helpText = "↑/↓ or j/k: navigate | enter: select | esc: close"
 	} else if m.mode == modeCacheManager {
-		help = helpStyle.Render("↑/↓ or j/k: navigate | enter: download | x: delete | esc: close") + " " + versionStyle.Render(versionString)
+		helpText = "↑/↓ or j/k: navigate | enter: download | x: delete | esc: close"
 	} else if m.showMillerColumns && m.millerFilterMode {
-		help = helpStyle.Render("Type to filter | enter/esc: exit filter mode") + " " + versionStyle.Render(versionString)
+		helpText = "Type to filter | enter/esc: exit filter mode"
 	} else if m.showMillerColumns {
-		help = helpStyle.Render("↑/↓ or j/k: navigate | ←/→ or h/l: switch column | /: filter | enter: select | v/esc: close") + " " + versionStyle.Render(versionString)
+		helpText = "↑/↓ or j/k: navigate | ←/→ or h/l: switch column | /: filter | enter: select | v/esc: close"
 	} else if m.showSidebar {
-		help = helpStyle.Render("↑/↓ or j/k: navigate | enter: select | [/esc: close") + " " + versionStyle.Render(versionString)
+		helpText = "↑/↓ or j/k: navigate | enter: select | [/esc: close"
 	} else {
-		help = helpStyle.Render("[: books | v: verse picker | /: search | c: compare | t: translation | T: theme | d: download | y: yank | n/pgdn: next | p/pgup: prev | q: quit") + " " + versionStyle.Render(versionString)
+		helpText = "[: books | v: verse picker | /: search | c: compare | t: translation | T: theme | d: download | y: yank | n/pgdn: next | p/pgup: prev | q: quit"
 	}
+
+	// Calculate padding to right-align version
+	helpLen := len(helpText)
+	versionLen := len(versionString)
+	totalLen := helpLen + versionLen + 3 // 3 for spacing
+	padding := ""
+	if m.width > totalLen {
+		padding = strings.Repeat(" ", m.width-totalLen)
+	}
+
+	help := statusBarStyle.Render(helpStyle.Render(helpText) + padding + versionStyle.Render(versionString))
 
 	var errorMsg string
 	if m.err != nil {
