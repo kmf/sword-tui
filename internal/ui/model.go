@@ -1669,6 +1669,13 @@ func (m Model) formatChapter(verses []api.Verse, bookName string, chapter int, w
 
 	var sb strings.Builder
 
+	// Calculate available width for text (accounting for verse number and spacing)
+	// Verse number is right-aligned in 4 chars + 2 spaces = 6 chars total
+	textWidth := width - 6
+	if textWidth < 40 {
+		textWidth = 40 // Minimum width
+	}
+
 	// Track if we're currently in a highlighted range
 	inHighlightedRange := false
 	var highlightedContent strings.Builder
@@ -1697,8 +1704,12 @@ func (m Model) formatChapter(verses []api.Verse, bookName string, chapter int, w
 
 			verseNum := highlightedVerseStyle.Render(verseNumStr)
 
+			// Calculate indent for wrapped lines (verse number width + 2 spaces)
+			indent := 6
+			// Account for border padding (2 chars on each side)
+			wrappedText := wrapTextWithIndent(text, textWidth-4, indent)
 			// Apply color using highlightedTextStyle but with inline rendering to preserve spacing
-			verseText := highlightedTextStyle.Inline(true).Render(text)
+			verseText := highlightedTextStyle.Inline(true).Render(wrappedText)
 
 			highlightedContent.WriteString(fmt.Sprintf("%s  %s", verseNum, verseText))
 
@@ -1714,8 +1725,11 @@ func (m Model) formatChapter(verses []api.Verse, bookName string, chapter int, w
 		} else {
 			verseNum := verseStyle.Render(verseNumStr)
 
+			// Calculate indent for wrapped lines (verse number width + 2 spaces)
+			indent := 6
+			wrappedText := wrapTextWithIndent(text, textWidth, indent)
 			// Apply color using textStyle but with inline rendering to preserve spacing
-			verseText := textStyle.Inline(true).Render(text)
+			verseText := textStyle.Inline(true).Render(wrappedText)
 
 			sb.WriteString(fmt.Sprintf("%s  %s\n\n", verseNum, verseText))
 		}
