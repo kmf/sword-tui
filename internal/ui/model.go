@@ -1421,15 +1421,21 @@ func (m Model) renderMillerColumns() string {
 	// Join the three columns horizontally
 	columnsView := lipgloss.JoinHorizontal(lipgloss.Top, booksColumn, chaptersColumn, versesColumn)
 
-	// Add shadow effect to the right of the columns
-	shadowStyle := lipgloss.NewStyle().
+	// Add shadow effect to the right of the columns with gradient
+	shadow1Style := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#333333")).
+		Background(lipgloss.Color("#333333"))
+	shadow2Style := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("#222222")).
 		Background(lipgloss.Color("#222222"))
+	shadow3Style := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#111111")).
+		Background(lipgloss.Color("#111111"))
 
 	columnsLines := strings.Split(columnsView, "\n")
 	shadowLines := make([]string, len(columnsLines))
 	for i := range columnsLines {
-		shadowLines[i] = shadowStyle.Render("▌")
+		shadowLines[i] = shadow1Style.Render("▌") + shadow2Style.Render("▌") + shadow3Style.Render("▌")
 	}
 
 	// Combine columns with shadow
@@ -1523,15 +1529,21 @@ func (m Model) renderSidebar() string {
 
 	sidebar := sidebarStyle.Render(sb.String())
 
-	// Add shadow effect to the right of the sidebar
-	shadowStyle := lipgloss.NewStyle().
+	// Add shadow effect to the right of the sidebar with gradient
+	shadow1Style := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#333333")).
+		Background(lipgloss.Color("#333333"))
+	shadow2Style := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("#222222")).
 		Background(lipgloss.Color("#222222"))
+	shadow3Style := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#111111")).
+		Background(lipgloss.Color("#111111"))
 
 	sidebarLines := strings.Split(sidebar, "\n")
 	shadowLines := make([]string, len(sidebarLines))
 	for i := range sidebarLines {
-		shadowLines[i] = shadowStyle.Render("▌")
+		shadowLines[i] = shadow1Style.Render("▌") + shadow2Style.Render("▌") + shadow3Style.Render("▌")
 	}
 
 	// Combine sidebar with shadow
