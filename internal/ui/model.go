@@ -1235,6 +1235,7 @@ func (m Model) renderMillerColumns() string {
 		Height(m.height - 2).
 		Border(lipgloss.NormalBorder()).
 		BorderForeground(m.currentTheme.BorderActive).
+		Background(m.currentTheme.Background).
 		Padding(1)
 
 	selectedStyle := lipgloss.NewStyle().
@@ -1476,7 +1477,8 @@ func (m Model) renderSidebar() string {
 		Width(30).
 		Height(m.height - 2).
 		Border(lipgloss.NormalBorder()).
-		BorderForeground(m.currentTheme.Border).
+		BorderForeground(m.currentTheme.BorderActive).
+		Background(m.currentTheme.Background).
 		Padding(1)
 
 	selectedStyle := lipgloss.NewStyle().
