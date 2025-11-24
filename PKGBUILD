@@ -1,4 +1,4 @@
-# Maintainer: Your Name <your.email@example.com>
+# Maintainer: Karl Fischer <kmf@fischer.org.za>
 pkgname=sword-tui
 pkgver=1.8.0
 pkgrel=1
