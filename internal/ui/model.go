@@ -45,6 +45,12 @@ type Model struct {
 	showSidebar            bool
 	currentVerses          []api.Verse
 	currentParallelVerses  map[string][]api.Verse
+	// Miller columns state
+	millerColumn           int // 0=books, 1=chapters, 2=verses
+	millerBookIdx          int
+	millerChapterIdx       int
+	millerVerseIdx         int
+	showMillerColumns      bool
 }
 
 type errMsg struct{ err error }
@@ -151,6 +157,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 			}
+		case "v":
+			if m.mode == modeReader && !m.showSidebar {
+				m.showMillerColumns = !m.showMillerColumns
+				if m.showMillerColumns && m.books != nil {
+					// Initialize Miller columns with current position
+					for i, book := range m.books {
+						if book.BookID == m.currentBook {
+							m.millerBookIdx = i
+							break
+						}
+					}
+					m.millerChapterIdx = m.currentChapter - 1
+					m.millerVerseIdx = 0
+					m.millerColumn = 0
+				}
+				return m, nil
+			}
 		case "/":
 			if m.mode == modeReader && !m.showSidebar {
 				m.mode = modeSearch
@@ -158,13 +181,73 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case "up", "k":
-			if m.showSidebar && m.sidebarSelected > 0 {
+			if m.showMillerColumns {
+				switch m.millerColumn {
+				case 0: // Books column
+					if m.millerBookIdx > 0 {
+						m.millerBookIdx--
+						m.millerChapterIdx = 0
+						m.millerVerseIdx = 0
+					}
+				case 1: // Chapters column
+					if m.millerChapterIdx > 0 {
+						m.millerChapterIdx--
+						m.millerVerseIdx = 0
+					}
+				case 2: // Verses column
+					if m.millerVerseIdx > 0 {
+						m.millerVerseIdx--
+					}
+				}
+				return m, nil
+			} else if m.showSidebar && m.sidebarSelected > 0 {
 				m.sidebarSelected--
 				return m, nil
 			}
 		case "down", "j":
-			if m.showSidebar && m.books != nil && m.sidebarSelected < len(m.books)-1 {
+			if m.showMillerColumns && m.books != nil {
+				switch m.millerColumn {
+				case 0: // Books column
+					if m.millerBookIdx < len(m.books)-1 {
+						m.millerBookIdx++
+						m.millerChapterIdx = 0
+						m.millerVerseIdx = 0
+					}
+				case 1: // Chapters column
+					selectedBook := m.books[m.millerBookIdx]
+					if m.millerChapterIdx < selectedBook.Chapters-1 {
+						m.millerChapterIdx++
+						m.millerVerseIdx = 0
+					}
+				case 2: // Verses column
+					if m.currentVerses != nil && m.millerVerseIdx < len(m.currentVerses)-1 {
+						m.millerVerseIdx++
+					}
+				}
+				return m, nil
+			} else if m.showSidebar && m.books != nil && m.sidebarSelected < len(m.books)-1 {
 				m.sidebarSelected++
+				return m, nil
+			}
+		case "left", "h":
+			if m.showMillerColumns && m.millerColumn > 0 {
+				m.millerColumn--
+				return m, nil
+			}
+		case "right", "l":
+			if m.showMillerColumns {
+				if m.millerColumn < 2 {
+					m.millerColumn++
+					// When moving to verses column, load the chapter if not already loaded
+					if m.millerColumn == 2 {
+						selectedBook := m.books[m.millerBookIdx]
+						selectedChapter := m.millerChapterIdx + 1
+						// Only load if different from current
+						if selectedBook.BookID != m.currentBook || selectedChapter != m.currentChapter {
+							return m, loadChapter(m.client, m.selectedTranslation, selectedBook.BookID, selectedChapter)
+						}
+					}
+				}
 				return m, nil
 			}
 		case "c":
@@ -205,7 +288,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, loadChapter(m.client, m.selectedTranslation, m.currentBook, m.currentChapter)
 			}
 		case "enter":
-			if m.showSidebar && m.books != nil {
+			if m.showMillerColumns && m.books != nil && m.currentVerses != nil {
+				// Navigate to the selected verse
+				selectedBook := m.books[m.millerBookIdx]
+				selectedChapter := m.millerChapterIdx + 1
+				m.currentBook = selectedBook.BookID
+				m.currentBookName = selectedBook.Name
+				m.currentChapter = selectedChapter
+				m.showMillerColumns = false
+				m.loading = true
+				// Scroll viewport to the selected verse
+				return m, loadChapter(m.client, m.selectedTranslation, m.currentBook, m.currentChapter)
+			} else if m.showSidebar && m.books != nil {
 				// Select book from sidebar
 				if m.sidebarSelected < len(m.books) {
 					m.currentBook = m.books[m.sidebarSelected].BookID
@@ -247,6 +341,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				)
 			}
 		case "esc":
+			if m.showMillerColumns {
+				m.showMillerColumns = false
+				return m, nil
+			}
 			if m.showSidebar {
 				m.showSidebar = false
 				return m, nil
@@ -427,10 +525,12 @@ func (m Model) View() string {
 	var help string
 	if m.loading {
 		help = helpStyle.Render("Loading...")
+	} else if m.showMillerColumns {
+		help = helpStyle.Render("↑/↓ or j/k: navigate | ←/→ or h/l: switch column | enter: select | v/esc: close")
 	} else if m.showSidebar {
 		help = helpStyle.Render("↑/↓ or j/k: navigate | enter: select | [/esc: close")
 	} else {
-		help = helpStyle.Render("[: books | /: search | c: compare | t: translation | n: next | p: prev | q: quit")
+		help = helpStyle.Render("[: books | v: verse picker | /: search | c: compare | t: translation | n: next | p: prev | q: quit")
 	}
 
 	var errorMsg string
@@ -439,6 +539,12 @@ func (m Model) View() string {
 	}
 
 	mainContent := fmt.Sprintf("%s\n%s\n%s%s", header, m.viewport.View(), help, errorMsg)
+
+	if m.showMillerColumns {
+		millerColumns := m.renderMillerColumns()
+		// Overlay Miller columns on top of the main content
+		return overlayContent(mainContent, millerColumns, m.width, m.height)
+	}
 
 	if m.showSidebar {
 		sidebar := m.renderSidebar()
@@ -509,6 +615,170 @@ func overlayContent(base, overlay string, width, height int) string {
 	}
 
 	return strings.Join(baseLines, "\n")
+}
+
+func (m Model) renderMillerColumns() string {
+	columnWidth := 30
+
+	columnStyle := lipgloss.NewStyle().
+		Width(columnWidth).
+		Height(m.height - 2).
+		Border(lipgloss.NormalBorder()).
+		BorderForeground(lipgloss.Color("240")).
+		Padding(1)
+
+	activeColumnStyle := lipgloss.NewStyle().
+		Width(columnWidth).
+		Height(m.height - 2).
+		Border(lipgloss.NormalBorder()).
+		BorderForeground(lipgloss.Color("86")).
+		Padding(1)
+
+	selectedStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("205")).
+		Bold(true)
+
+	normalStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("252"))
+
+	headerStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("86")).
+		Bold(true)
+
+	// Column 1: Books
+	var booksContent strings.Builder
+	booksContent.WriteString(headerStyle.Render("BOOKS") + "\n\n")
+
+	if m.books != nil {
+		visibleItems := m.height - 8
+		if visibleItems < 5 {
+			visibleItems = 5
+		}
+
+		startIdx := m.millerBookIdx - visibleItems/2
+		if startIdx < 0 {
+			startIdx = 0
+		}
+		endIdx := startIdx + visibleItems
+		if endIdx > len(m.books) {
+			endIdx = len(m.books)
+			startIdx = endIdx - visibleItems
+			if startIdx < 0 {
+				startIdx = 0
+			}
+		}
+
+		if startIdx > 0 {
+			booksContent.WriteString(normalStyle.Render(fmt.Sprintf("... (%d)\n", startIdx)))
+		}
+
+		for i := startIdx; i < endIdx && i < len(m.books); i++ {
+			book := m.books[i]
+			name := book.Name
+			if len(name) > 26 {
+				name = name[:23] + "..."
+			}
+
+			if i == m.millerBookIdx {
+				booksContent.WriteString(selectedStyle.Render("> "+name) + "\n")
+			} else {
+				booksContent.WriteString(normalStyle.Render("  "+name) + "\n")
+			}
+		}
+
+		if endIdx < len(m.books) {
+			booksContent.WriteString(normalStyle.Render(fmt.Sprintf("... (%d)\n", len(m.books)-endIdx)))
+		}
+	}
+
+	var booksColumn string
+	if m.millerColumn == 0 {
+		booksColumn = activeColumnStyle.Render(booksContent.String())
+	} else {
+		booksColumn = columnStyle.Render(booksContent.String())
+	}
+
+	// Column 2: Chapters
+	var chaptersContent strings.Builder
+	chaptersContent.WriteString(headerStyle.Render("CHAPTERS") + "\n\n")
+
+	if m.books != nil && m.millerBookIdx < len(m.books) {
+		selectedBook := m.books[m.millerBookIdx]
+		for i := 0; i < selectedBook.Chapters; i++ {
+			chapterNum := fmt.Sprintf("Chapter %d", i+1)
+			if i == m.millerChapterIdx {
+				chaptersContent.WriteString(selectedStyle.Render("> "+chapterNum) + "\n")
+			} else {
+				chaptersContent.WriteString(normalStyle.Render("  "+chapterNum) + "\n")
+			}
+		}
+	}
+
+	var chaptersColumn string
+	if m.millerColumn == 1 {
+		chaptersColumn = activeColumnStyle.Render(chaptersContent.String())
+	} else {
+		chaptersColumn = columnStyle.Render(chaptersContent.String())
+	}
+
+	// Column 3: Verses
+	var versesContent strings.Builder
+	versesContent.WriteString(headerStyle.Render("VERSES") + "\n\n")
+
+	if m.currentVerses != nil {
+		visibleItems := m.height - 8
+		if visibleItems < 5 {
+			visibleItems = 5
+		}
+
+		startIdx := m.millerVerseIdx - visibleItems/2
+		if startIdx < 0 {
+			startIdx = 0
+		}
+		endIdx := startIdx + visibleItems
+		if endIdx > len(m.currentVerses) {
+			endIdx = len(m.currentVerses)
+			startIdx = endIdx - visibleItems
+			if startIdx < 0 {
+				startIdx = 0
+			}
+		}
+
+		if startIdx > 0 {
+			versesContent.WriteString(normalStyle.Render(fmt.Sprintf("... (%d)\n", startIdx)))
+		}
+
+		for i := startIdx; i < endIdx && i < len(m.currentVerses); i++ {
+			verse := m.currentVerses[i]
+			text := stripHTMLTags(verse.Text)
+			if len(text) > 23 {
+				text = text[:20] + "..."
+			}
+			verseLabel := fmt.Sprintf("%d. %s", verse.Verse, text)
+
+			if i == m.millerVerseIdx {
+				versesContent.WriteString(selectedStyle.Render("> "+verseLabel) + "\n")
+			} else {
+				versesContent.WriteString(normalStyle.Render("  "+verseLabel) + "\n")
+			}
+		}
+
+		if endIdx < len(m.currentVerses) {
+			versesContent.WriteString(normalStyle.Render(fmt.Sprintf("... (%d)\n", len(m.currentVerses)-endIdx)))
+		}
+	} else {
+		versesContent.WriteString(normalStyle.Render("  Loading..."))
+	}
+
+	var versesColumn string
+	if m.millerColumn == 2 {
+		versesColumn = activeColumnStyle.Render(versesContent.String())
+	} else {
+		versesColumn = columnStyle.Render(versesContent.String())
+	}
+
+	// Join the three columns horizontally
+	return lipgloss.JoinHorizontal(lipgloss.Top, booksColumn, chaptersColumn, versesColumn)
 }
 
 func (m Model) renderSidebar() string {
