@@ -1421,6 +1421,29 @@ func (m Model) renderMillerColumns() string {
 	// Join the three columns horizontally
 	columnsView := lipgloss.JoinHorizontal(lipgloss.Top, booksColumn, chaptersColumn, versesColumn)
 
+	// Add shadow effect to the right of the columns
+	shadowStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#222222")).
+		Background(lipgloss.Color("#222222"))
+
+	columnsLines := strings.Split(columnsView, "\n")
+	shadowLines := make([]string, len(columnsLines))
+	for i := range columnsLines {
+		shadowLines[i] = shadowStyle.Render("▌")
+	}
+
+	// Combine columns with shadow
+	var columnsWithShadow strings.Builder
+	for i := 0; i < len(columnsLines); i++ {
+		columnsWithShadow.WriteString(columnsLines[i])
+		if i < len(shadowLines) {
+			columnsWithShadow.WriteString(shadowLines[i])
+		}
+		if i < len(columnsLines)-1 {
+			columnsWithShadow.WriteString("\n")
+		}
+	}
+
 	// Add status bar at the bottom
 	statusBarStyle := lipgloss.NewStyle().
 		Foreground(m.currentTheme.Muted).
@@ -1439,7 +1462,7 @@ func (m Model) renderMillerColumns() string {
 	statusBar := statusBarStyle.Render(statusText)
 
 	// Join columns and status bar vertically
-	return lipgloss.JoinVertical(lipgloss.Left, columnsView, statusBar)
+	return lipgloss.JoinVertical(lipgloss.Left, columnsWithShadow.String(), statusBar)
 }
 
 func (m Model) renderSidebar() string {
@@ -1498,7 +1521,32 @@ func (m Model) renderSidebar() string {
 		}
 	}
 
-	return sidebarStyle.Render(sb.String())
+	sidebar := sidebarStyle.Render(sb.String())
+
+	// Add shadow effect to the right of the sidebar
+	shadowStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("#222222")).
+		Background(lipgloss.Color("#222222"))
+
+	sidebarLines := strings.Split(sidebar, "\n")
+	shadowLines := make([]string, len(sidebarLines))
+	for i := range sidebarLines {
+		shadowLines[i] = shadowStyle.Render("▌")
+	}
+
+	// Combine sidebar with shadow
+	var result strings.Builder
+	for i := 0; i < len(sidebarLines); i++ {
+		result.WriteString(sidebarLines[i])
+		if i < len(shadowLines) {
+			result.WriteString(shadowLines[i])
+		}
+		if i < len(sidebarLines)-1 {
+			result.WriteString("\n")
+		}
+	}
+
+	return result.String()
 }
 
 func (m Model) renderTranslationSelect(header, help, errorMsg string) string {
