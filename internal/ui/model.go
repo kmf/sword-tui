@@ -43,8 +43,6 @@ type Model struct {
 	comparisonTranslations []string
 	sidebarSelected        int
 	showSidebar            bool
-	showTranslationList    bool
-	translationSelected    int
 	currentVerses          []api.Verse
 	currentParallelVerses  map[string][]api.Verse
 }
@@ -153,20 +151,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 			}
-		case "]":
-			if m.mode == modeReader {
-				m.showTranslationList = !m.showTranslationList
-				if m.showTranslationList && m.translations != nil {
-					// Find current translation index
-					for i, trans := range m.translations {
-						if trans.ShortName == m.selectedTranslation {
-							m.translationSelected = i
-							break
-						}
-					}
-				}
-				return m, nil
-			}
 		case "/":
 			if m.mode == modeReader && !m.showSidebar {
 				m.mode = modeSearch
@@ -174,18 +158,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case "up", "k":
-			if m.showTranslationList && m.translationSelected > 0 {
-				m.translationSelected--
-				return m, nil
-			} else if m.showSidebar && m.sidebarSelected > 0 {
+			if m.showSidebar && m.sidebarSelected > 0 {
 				m.sidebarSelected--
 				return m, nil
 			}
 		case "down", "j":
-			if m.showTranslationList && m.translations != nil && m.translationSelected < len(m.translations)-1 {
-				m.translationSelected++
-				return m, nil
-			} else if m.showSidebar && m.books != nil && m.sidebarSelected < len(m.books)-1 {
+			if m.showSidebar && m.books != nil && m.sidebarSelected < len(m.books)-1 {
 				m.sidebarSelected++
 				return m, nil
 			}
@@ -204,7 +182,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case "t":
-			if m.mode == modeReader && !m.showSidebar && !m.showTranslationList {
+			if m.mode == modeReader && !m.showSidebar {
 				m.mode = modeTranslationSelect
 				return m, nil
 			}
@@ -227,18 +205,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, loadChapter(m.client, m.selectedTranslation, m.currentBook, m.currentChapter)
 			}
 		case "enter":
-			if m.showTranslationList && m.translations != nil {
-				// Select translation from list
-				if m.translationSelected < len(m.translations) {
-					m.selectedTranslation = m.translations[m.translationSelected].ShortName
-					m.showTranslationList = false
-					m.loading = true
-					return m, tea.Batch(
-						loadBooks(m.client, m.selectedTranslation),
-						loadChapter(m.client, m.selectedTranslation, m.currentBook, m.currentChapter),
-					)
-				}
-			} else if m.showSidebar && m.books != nil {
+			if m.showSidebar && m.books != nil {
 				// Select book from sidebar
 				if m.sidebarSelected < len(m.books) {
 					m.currentBook = m.books[m.sidebarSelected].BookID
@@ -280,10 +247,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				)
 			}
 		case "esc":
-			if m.showTranslationList {
-				m.showTranslationList = false
-				return m, nil
-			}
 			if m.showSidebar {
 				m.showSidebar = false
 				return m, nil
@@ -464,12 +427,10 @@ func (m Model) View() string {
 	var help string
 	if m.loading {
 		help = helpStyle.Render("Loading...")
-	} else if m.showTranslationList {
-		help = helpStyle.Render("↑/↓ or j/k: navigate | enter: select | ]/esc: close")
 	} else if m.showSidebar {
 		help = helpStyle.Render("↑/↓ or j/k: navigate | enter: select | [/esc: close")
 	} else {
-		help = helpStyle.Render("[: books | ]: translations | /: search | c: compare | n: next | p: prev | q: quit")
+		help = helpStyle.Render("[: books | /: search | c: compare | t: translation | n: next | p: prev | q: quit")
 	}
 
 	var errorMsg string
@@ -477,19 +438,17 @@ func (m Model) View() string {
 		errorMsg = "\n" + errorStyle.Render(fmt.Sprintf("Error: %v", m.err))
 	}
 
-	if m.showTranslationList {
-		translationList := m.renderTranslationList()
-		mainContent := fmt.Sprintf("%s\n%s\n%s%s", header, m.viewport.View(), help, errorMsg)
-		return lipgloss.JoinHorizontal(lipgloss.Top, mainContent, translationList)
-	}
+	mainContent := fmt.Sprintf("%s\n%s\n%s%s", header, m.viewport.View(), help, errorMsg)
 
 	if m.showSidebar {
 		sidebar := m.renderSidebar()
-		mainContent := fmt.Sprintf("%s\n%s\n%s%s", header, m.viewport.View(), help, errorMsg)
-		return lipgloss.JoinHorizontal(lipgloss.Top, sidebar, mainContent)
+		// Place sidebar over the content
+		return lipgloss.Place(m.width, m.height, lipgloss.Left, lipgloss.Top,
+			mainContent, lipgloss.WithWhitespaceChars(" "), lipgloss.WithWhitespaceForeground(lipgloss.Color("0"))) +
+			lipgloss.Place(m.width, m.height, lipgloss.Left, lipgloss.Top, sidebar)
 	}
 
-	return fmt.Sprintf("%s\n%s\n%s%s", header, m.viewport.View(), help, errorMsg)
+	return mainContent
 }
 
 func (m Model) renderSidebar() string {
@@ -543,77 +502,6 @@ func (m Model) renderSidebar() string {
 	}
 
 	return sidebarStyle.Render(sb.String())
-}
-
-func (m Model) renderTranslationList() string {
-	listStyle := lipgloss.NewStyle().
-		Width(40).
-		MaxHeight(m.height - 2).
-		Border(lipgloss.NormalBorder()).
-		BorderForeground(lipgloss.Color("240")).
-		Padding(1)
-
-	selectedStyle := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("205")).
-		Bold(true)
-
-	normalStyle := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("252"))
-
-	headerStyle := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("86")).
-		Bold(true)
-
-	var sb strings.Builder
-	sb.WriteString(headerStyle.Render("TRANSLATIONS") + "\n\n")
-
-	if m.translations != nil && len(m.translations) > 0 {
-		// Calculate visible window around selected item
-		visibleItems := m.height - 8 // Account for header, padding, borders
-		if visibleItems < 5 {
-			visibleItems = 5
-		}
-
-		startIdx := m.translationSelected - visibleItems/2
-		if startIdx < 0 {
-			startIdx = 0
-		}
-		endIdx := startIdx + visibleItems
-		if endIdx > len(m.translations) {
-			endIdx = len(m.translations)
-			startIdx = endIdx - visibleItems
-			if startIdx < 0 {
-				startIdx = 0
-			}
-		}
-
-		// Show position indicator
-		if startIdx > 0 {
-			sb.WriteString(normalStyle.Render(fmt.Sprintf("  ... (%d more above)\n", startIdx)))
-		}
-
-		for i := startIdx; i < endIdx && i < len(m.translations); i++ {
-			trans := m.translations[i]
-			displayName := fmt.Sprintf("%s - %s", trans.ShortName, trans.FullName)
-			if len(displayName) > 36 {
-				displayName = displayName[:33] + "..."
-			}
-
-			if i == m.translationSelected {
-				sb.WriteString(selectedStyle.Render("> "+displayName) + "\n")
-			} else {
-				sb.WriteString(normalStyle.Render("  "+displayName) + "\n")
-			}
-		}
-
-		if endIdx < len(m.translations) {
-			sb.WriteString(normalStyle.Render(fmt.Sprintf("  ... (%d more below)\n", len(m.translations)-endIdx)))
-		}
-	} else {
-		sb.WriteString(normalStyle.Render("  Loading translations..."))
-	}
-
-	return listStyle.Render(sb.String())
 }
 
 func formatChapter(verses []api.Verse, bookName string, chapter int, width int) string {
