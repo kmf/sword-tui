@@ -442,13 +442,73 @@ func (m Model) View() string {
 
 	if m.showSidebar {
 		sidebar := m.renderSidebar()
-		// Place sidebar over the content
-		return lipgloss.Place(m.width, m.height, lipgloss.Left, lipgloss.Top,
-			mainContent, lipgloss.WithWhitespaceChars(" "), lipgloss.WithWhitespaceForeground(lipgloss.Color("0"))) +
-			lipgloss.Place(m.width, m.height, lipgloss.Left, lipgloss.Top, sidebar)
+		// Overlay the sidebar on top of the main content
+		return overlayContent(mainContent, sidebar, m.width, m.height)
 	}
 
 	return mainContent
+}
+
+func overlayContent(base, overlay string, width, height int) string {
+	// Split both strings into lines
+	baseLines := strings.Split(base, "\n")
+	overlayLines := strings.Split(overlay, "\n")
+
+	// Ensure we have enough base lines
+	for len(baseLines) < height {
+		baseLines = append(baseLines, "")
+	}
+
+	// Overlay the sidebar lines onto the base lines
+	for i := 0; i < len(overlayLines) && i < len(baseLines); i++ {
+		overlayLine := overlayLines[i]
+		baseLine := baseLines[i]
+
+		// Get the visual width of the overlay line (accounting for ANSI codes)
+		overlayWidth := lipgloss.Width(overlayLine)
+
+		// Pad base line to full width if needed
+		baseWidth := lipgloss.Width(baseLine)
+		if baseWidth < width {
+			baseLine += strings.Repeat(" ", width-baseWidth)
+		}
+
+		// Replace the beginning of the base line with the overlay line
+		if overlayWidth > 0 {
+			// For lines with ANSI codes, we need to be careful
+			// Just replace the visual portion
+			if len(overlayLine) > 0 {
+				// Simple approach: trim base line and prepend overlay
+				baseRunes := []rune(baseLine)
+				visualPos := 0
+				runePos := 0
+				inAnsi := false
+
+				// Count runes until we reach the visual width
+				for runePos < len(baseRunes) && visualPos < overlayWidth {
+					if baseRunes[runePos] == '\x1b' {
+						inAnsi = true
+					}
+					if !inAnsi {
+						visualPos++
+					}
+					if inAnsi && baseRunes[runePos] == 'm' {
+						inAnsi = false
+					}
+					runePos++
+				}
+
+				// Combine overlay with remaining base content
+				if runePos < len(baseRunes) {
+					baseLines[i] = overlayLine + string(baseRunes[runePos:])
+				} else {
+					baseLines[i] = overlayLine
+				}
+			}
+		}
+	}
+
+	return strings.Join(baseLines, "\n")
 }
 
 func (m Model) renderSidebar() string {
