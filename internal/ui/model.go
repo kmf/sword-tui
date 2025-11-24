@@ -2315,7 +2315,8 @@ func (m Model) renderAbout(header, help, errorMsg string) string {
 	content.WriteString(labelStyle.Render("Build: ") + valueStyle.Render(version.BuildNumber) + "\n\n")
 
 	// Repository
-	content.WriteString(labelStyle.Render("Repository: ") + linkStyle.Render("https://github.com/kmf/sword-tui") + "\n\n")
+	content.WriteString(labelStyle.Render("Repository: ") + linkStyle.Render("https://github.com/kmf/sword-tui") + "\n")
+	content.WriteString(labelStyle.Render("Report Issues: ") + linkStyle.Render("https://github.com/kmf/sword-tui/issues") + "\n\n")
 
 	// API
 	content.WriteString(labelStyle.Render("API: ") + valueStyle.Render("bolls.life") + "\n")
