@@ -1708,8 +1708,8 @@ func (m Model) formatChapter(verses []api.Verse, bookName string, chapter int, w
 			indent := 6
 			// Account for border padding (2 chars on each side)
 			wrappedText := wrapTextWithIndent(text, textWidth-4, indent)
-			// Apply color using highlightedTextStyle but with inline rendering to preserve spacing
-			verseText := highlightedTextStyle.Inline(true).Render(wrappedText)
+			// Apply color with width set to prevent terminal wrapping
+			verseText := highlightedTextStyle.Width(textWidth - 4).Render(wrappedText)
 
 			highlightedContent.WriteString(fmt.Sprintf("%s  %s", verseNum, verseText))
 
@@ -1728,8 +1728,8 @@ func (m Model) formatChapter(verses []api.Verse, bookName string, chapter int, w
 			// Calculate indent for wrapped lines (verse number width + 2 spaces)
 			indent := 6
 			wrappedText := wrapTextWithIndent(text, textWidth, indent)
-			// Apply color using textStyle but with inline rendering to preserve spacing
-			verseText := textStyle.Inline(true).Render(wrappedText)
+			// Apply color with width set to prevent terminal wrapping
+			verseText := textStyle.Width(textWidth).Render(wrappedText)
 
 			sb.WriteString(fmt.Sprintf("%s  %s\n\n", verseNum, verseText))
 		}
