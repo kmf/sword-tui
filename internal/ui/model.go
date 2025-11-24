@@ -1136,12 +1136,16 @@ func (m *Model) applyMillerFilter() {
 }
 
 // dimContent applies a dimming effect to content by reducing color intensity
+// and adding a dark overlay for a fog/shadow effect
 func dimContent(content string) string {
 	lines := strings.Split(content, "\n")
 	dimmedLines := make([]string, len(lines))
 
-	// Create a dim style that reduces opacity
-	dimStyle := lipgloss.NewStyle().Faint(true)
+	// Create a dim style with darker colors to simulate fog/shadow
+	// Using Faint() for dimming and adding a dark semi-transparent effect
+	dimStyle := lipgloss.NewStyle().
+		Faint(true).
+		Foreground(lipgloss.Color("#555555")) // Dark gray to create fog effect
 
 	for i, line := range lines {
 		// Apply faint style to dim the line
