@@ -1240,7 +1240,7 @@ func (m Model) renderMillerColumns() string {
 
 	selectedStyle := lipgloss.NewStyle().
 		Foreground(m.currentTheme.Accent).
-		Background(m.currentTheme.Highlight).
+		Background(m.currentTheme.Background).
 		Bold(true).
 		Padding(0, 1)
 
@@ -1483,7 +1483,7 @@ func (m Model) renderSidebar() string {
 
 	selectedStyle := lipgloss.NewStyle().
 		Foreground(m.currentTheme.Accent).
-		Background(m.currentTheme.Highlight).
+		Background(m.currentTheme.Background).
 		Bold(true).
 		Padding(0, 1)
 
@@ -1763,7 +1763,6 @@ func (m Model) formatChapter(verses []api.Verse, bookName string, chapter int, w
 
 	highlightedTextStyle := lipgloss.NewStyle().
 		Foreground(m.currentTheme.Primary).
-		Background(m.currentTheme.Highlight).
 		Bold(true)
 
 	highlightedContainerStyle := lipgloss.NewStyle().
