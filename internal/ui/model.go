@@ -45,6 +45,7 @@ type Model struct {
 	showSidebar            bool
 	currentVerses          []api.Verse
 	currentParallelVerses  map[string][]api.Verse
+	highlightedVerse       int // Currently highlighted verse number
 	// Miller columns state
 	millerColumn           int // 0=books, 1=chapters, 2=verses
 	millerBookIdx          int
@@ -437,7 +438,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Reformat content with new width
 		if m.currentVerses != nil {
-			m.content = formatChapter(m.currentVerses, m.currentBookName, m.currentChapter, m.width)
+			m.content = formatChapter(m.currentVerses, m.currentBookName, m.currentChapter, m.width, m.highlightedVerse)
 		} else if m.currentParallelVerses != nil {
 			m.content = formatParallelVerses(m.currentParallelVerses, m.comparisonTranslations, m.currentBookName, m.currentChapter, m.width)
 		}
@@ -459,7 +460,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.loading = false
 		m.currentVerses = msg.verses
 		m.currentParallelVerses = nil
-		m.content = formatChapter(msg.verses, m.currentBookName, m.currentChapter, m.width)
+		// Initialize highlighted verse to first verse
+		if len(msg.verses) > 0 {
+			m.highlightedVerse = msg.verses[0].Verse
+		} else {
+			m.highlightedVerse = 1
+		}
+		m.content = formatChapter(msg.verses, m.currentBookName, m.currentChapter, m.width, m.highlightedVerse)
 		m.viewport.SetContent(m.content)
 		m.viewport.GotoTop()
 
@@ -480,8 +487,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.textInput, cmd = m.textInput.Update(msg)
 		cmds = append(cmds, cmd)
 	} else {
+		oldYOffset := m.viewport.YOffset
 		m.viewport, cmd = m.viewport.Update(msg)
 		cmds = append(cmds, cmd)
+
+		// Update highlighted verse based on viewport position
+		if m.currentVerses != nil && oldYOffset != m.viewport.YOffset {
+			newHighlightedVerse := m.calculateHighlightedVerse()
+			if newHighlightedVerse != m.highlightedVerse {
+				m.highlightedVerse = newHighlightedVerse
+				// Reformat content with new highlighted verse
+				m.content = formatChapter(m.currentVerses, m.currentBookName, m.currentChapter, m.width, m.highlightedVerse)
+				m.viewport.SetContent(m.content)
+			}
+		}
 	}
 
 	return m, tea.Batch(cmds...)
@@ -553,6 +572,51 @@ func (m Model) View() string {
 	}
 
 	return mainContent
+}
+
+func (m Model) calculateHighlightedVerse() int {
+	if m.currentVerses == nil || len(m.currentVerses) == 0 {
+		return 1
+	}
+
+	// Each verse takes approximately 3-4 lines (verse number + text + blank line)
+	// We'll calculate which verse is at the top of the viewport
+	yOffset := m.viewport.YOffset
+
+	// Count lines to find which verse we're at
+	currentLine := 0
+	for _, verse := range m.currentVerses {
+		text := stripHTMLTags(verse.Text)
+		verseNumStr := fmt.Sprintf("%d", verse.Verse)
+		indent := len(verseNumStr) + 2
+
+		// Calculate available width
+		textWidth := m.width - 10
+		if textWidth < 40 {
+			textWidth = 40
+		}
+
+		// Calculate how many lines this verse takes
+		wrappedText := wrapTextWithIndent(text, textWidth, indent)
+		linesInVerse := strings.Count(wrappedText, "\n") + 1
+
+		// Add verse number line + wrapped text lines + blank line
+		verseTotalLines := linesInVerse + 2
+
+		// If the current line + verse lines exceeds yOffset, this is our verse
+		if currentLine+verseTotalLines > yOffset {
+			return verse.Verse
+		}
+
+		currentLine += verseTotalLines
+	}
+
+	// If we've scrolled past all verses, return the last one
+	if len(m.currentVerses) > 0 {
+		return m.currentVerses[len(m.currentVerses)-1].Verse
+	}
+
+	return 1
 }
 
 func overlayContent(base, overlay string, width, height int) string {
@@ -834,12 +898,20 @@ func (m Model) renderSidebar() string {
 	return sidebarStyle.Render(sb.String())
 }
 
-func formatChapter(verses []api.Verse, bookName string, chapter int, width int) string {
+func formatChapter(verses []api.Verse, bookName string, chapter int, width int, highlightedVerse int) string {
 	verseStyle := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("147"))
 
+	highlightedVerseStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("205")).
+		Bold(true)
+
 	textStyle := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("252"))
+
+	highlightedTextStyle := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("252")).
+		Background(lipgloss.Color("235"))
 
 	var sb strings.Builder
 
@@ -853,14 +925,26 @@ func formatChapter(verses []api.Verse, bookName string, chapter int, width int) 
 		// Remove HTML tags
 		text := stripHTMLTags(v.Text)
 		verseNumStr := fmt.Sprintf("%d", v.Verse)
-		verseNum := verseStyle.Render(verseNumStr)
 
-		// Calculate indent for wrapped lines (verse number length + 2 spaces)
-		indent := len(verseNumStr) + 2
+		// Use highlighted style if this is the current verse
+		var verseNum string
+		var verseText string
+		if v.Verse == highlightedVerse {
+			verseNum = highlightedVerseStyle.Render(verseNumStr)
 
-		// Wrap text to available width
-		wrappedText := wrapTextWithIndent(text, textWidth, indent)
-		verseText := textStyle.Render(wrappedText)
+			// Calculate indent for wrapped lines (verse number length + 2 spaces)
+			indent := len(verseNumStr) + 2
+			wrappedText := wrapTextWithIndent(text, textWidth, indent)
+			verseText = highlightedTextStyle.Render(wrappedText)
+		} else {
+			verseNum = verseStyle.Render(verseNumStr)
+
+			// Calculate indent for wrapped lines (verse number length + 2 spaces)
+			indent := len(verseNumStr) + 2
+			wrappedText := wrapTextWithIndent(text, textWidth, indent)
+			verseText = textStyle.Render(wrappedText)
+		}
+
 		sb.WriteString(fmt.Sprintf("%s  %s\n\n", verseNum, verseText))
 	}
 
