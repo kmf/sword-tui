@@ -1135,7 +1135,26 @@ func (m *Model) applyMillerFilter() {
 	}
 }
 
+// dimContent applies a dimming effect to content by reducing color intensity
+func dimContent(content string) string {
+	lines := strings.Split(content, "\n")
+	dimmedLines := make([]string, len(lines))
+
+	// Create a dim style that reduces opacity
+	dimStyle := lipgloss.NewStyle().Faint(true)
+
+	for i, line := range lines {
+		// Apply faint style to dim the line
+		dimmedLines[i] = dimStyle.Render(line)
+	}
+
+	return strings.Join(dimmedLines, "\n")
+}
+
 func overlayContent(base, overlay string, width, height int) string {
+	// Dim the base content to create a focus effect
+	base = dimContent(base)
+
 	// Split both strings into lines
 	baseLines := strings.Split(base, "\n")
 	overlayLines := strings.Split(overlay, "\n")

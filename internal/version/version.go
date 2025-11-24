@@ -1,7 +1,7 @@
 package version
 
 // Version is the current version of sword-tui
-const Version = "v1.3.0"
+const Version = "v1.4.0"
 
 // BuildNumber is set during compilation via -ldflags
 var BuildNumber = "dev"
