@@ -1669,12 +1669,6 @@ func (m Model) formatChapter(verses []api.Verse, bookName string, chapter int, w
 
 	var sb strings.Builder
 
-	// Calculate available width for text (accounting for verse number and spacing)
-	textWidth := width - 10 // Reserve space for verse number and padding
-	if textWidth < 40 {
-		textWidth = 40 // Minimum width
-	}
-
 	// Track if we're currently in a highlighted range
 	inHighlightedRange := false
 	var highlightedContent strings.Builder
@@ -1703,10 +1697,8 @@ func (m Model) formatChapter(verses []api.Verse, bookName string, chapter int, w
 
 			verseNum := highlightedVerseStyle.Render(verseNumStr)
 
-			// Calculate indent for wrapped lines (verse number length + 2 spaces)
-			indent := len(verseNumStr) + 2
-			wrappedText := wrapTextWithIndent(text, textWidth-4, indent) // Account for border padding
-			verseText := highlightedTextStyle.Render(wrappedText)
+			// Apply color using highlightedTextStyle but with inline rendering to preserve spacing
+			verseText := highlightedTextStyle.Inline(true).Render(text)
 
 			highlightedContent.WriteString(fmt.Sprintf("%s  %s", verseNum, verseText))
 
@@ -1722,11 +1714,8 @@ func (m Model) formatChapter(verses []api.Verse, bookName string, chapter int, w
 		} else {
 			verseNum := verseStyle.Render(verseNumStr)
 
-			// Calculate indent for wrapped lines (verse number length + 2 spaces)
-			indent := len(verseNumStr) + 2
-			wrappedText := wrapTextWithIndent(text, textWidth, indent)
 			// Apply color using textStyle but with inline rendering to preserve spacing
-			verseText := textStyle.Inline(true).Render(wrappedText)
+			verseText := textStyle.Inline(true).Render(text)
 
 			sb.WriteString(fmt.Sprintf("%s  %s\n\n", verseNum, verseText))
 		}
@@ -1803,8 +1792,8 @@ func wrapTextWithIndent(text string, width int, indent int) string {
 			currentLength = indent
 		}
 
-		// Add space before word (except at start of line)
-		if currentLength > 0 && currentLength != indent {
+		// Add space before word (except at the very start of a line where currentLength is 0)
+		if currentLength > 0 {
 			currentLine.WriteString(" ")
 			currentLength++
 		}
