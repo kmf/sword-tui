@@ -10,14 +10,25 @@ import (
 
 const baseURL = "https://bolls.life"
 
+type CacheInterface interface {
+	IsCached(translation string) bool
+	GetChapter(translation string, book, chapter int) ([]Verse, error)
+	GetVerse(translation string, book, chapter, verse int) (*Verse, error)
+}
+
 type Client struct {
 	httpClient *http.Client
+	cache      CacheInterface
 }
 
 func NewClient() *Client {
 	return &Client{
 		httpClient: &http.Client{},
 	}
+}
+
+func (c *Client) SetCache(cache CacheInterface) {
+	c.cache = cache
 }
 
 type Translation struct {
@@ -105,6 +116,12 @@ func (c *Client) GetBooks(translation string) ([]Book, error) {
 }
 
 func (c *Client) GetChapter(translation string, book, chapter int) ([]Verse, error) {
+	// Try cache first if available
+	if c.cache != nil && c.cache.IsCached(translation) {
+		return c.cache.GetChapter(translation, book, chapter)
+	}
+
+	// Fall back to API
 	url := fmt.Sprintf("%s/get-text/%s/%d/%d/", baseURL, translation, book, chapter)
 	resp, err := c.httpClient.Get(url)
 	if err != nil {
@@ -126,6 +143,12 @@ func (c *Client) GetChapter(translation string, book, chapter int) ([]Verse, err
 }
 
 func (c *Client) GetVerse(translation string, book, chapter, verse int) (*Verse, error) {
+	// Try cache first if available
+	if c.cache != nil && c.cache.IsCached(translation) {
+		return c.cache.GetVerse(translation, book, chapter, verse)
+	}
+
+	// Fall back to API
 	url := fmt.Sprintf("%s/get-verse/%s/%d/%d/%d/", baseURL, translation, book, chapter, verse)
 	resp, err := c.httpClient.Get(url)
 	if err != nil {

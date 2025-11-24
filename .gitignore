@@ -17,3 +17,6 @@ vendor/
 
 # Go workspace file
 go.work
+
+# Build number tracking
+.build_number

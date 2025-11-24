@@ -3,14 +3,26 @@ package main
 import (
 	"fmt"
 	"os"
+	"sword-tui/internal/cache"
 	"sword-tui/internal/ui"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
 
 func main() {
+	// Initialize cache
+	cacheManager, err := cache.NewCache()
+	if err != nil {
+		fmt.Printf("Warning: Could not initialize cache: %v\n", err)
+		// Continue without cache
+		cacheManager = nil
+	}
+
+	model := ui.NewModel()
+	model.SetCache(cacheManager)
+
 	p := tea.NewProgram(
-		ui.NewModel(),
+		model,
 		tea.WithAltScreen(),
 		tea.WithMouseCellMotion(),
 	)
