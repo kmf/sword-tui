@@ -26,6 +26,7 @@ const (
 	modeSidebar
 	modeCacheManager
 	modeThemeSelect
+	modeAbout
 )
 
 type Model struct {
@@ -463,6 +464,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 			}
+		case "?":
+			if m.mode == modeReader && !m.showSidebar {
+				m.mode = modeAbout
+				return m, nil
+			}
 		case "n":
 			if m.mode == modeReader && m.books != nil {
 				for _, book := range m.books {
@@ -668,7 +674,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.showSidebar = false
 				return m, nil
 			}
-			if m.mode == modeSearch || m.mode == modeTranslationSelect || m.mode == modeThemeSelect {
+			if m.mode == modeSearch || m.mode == modeTranslationSelect || m.mode == modeThemeSelect || m.mode == modeAbout {
 				m.mode = modeReader
 				return m, nil
 			}
@@ -903,6 +909,8 @@ func (m Model) View() string {
 		header = headerStyle.Render(logoStyle.Render(logo) + " " + fmt.Sprintf("Comparison View - %s %d", m.currentBookName, m.currentChapter))
 	} else if m.mode == modeCacheManager {
 		header = headerStyle.Render(logoStyle.Render(logo) + " Download Translations")
+	} else if m.mode == modeAbout {
+		header = headerStyle.Render(logoStyle.Render(logo) + " About")
 	} else {
 		// Check if current translation is cached
 		offlineIndicator := ""
@@ -953,6 +961,8 @@ func (m Model) View() string {
 		helpText = "↑/↓ or j/k: navigate | enter: select | esc: close"
 	} else if m.mode == modeCacheManager {
 		helpText = "↑/↓ or j/k: navigate | enter: download | x: delete | esc: close"
+	} else if m.mode == modeAbout {
+		helpText = "esc: close"
 	} else if m.showMillerColumns && m.millerFilterMode {
 		helpText = "Type to filter | enter/esc: exit filter mode"
 	} else if m.showMillerColumns {
@@ -960,7 +970,7 @@ func (m Model) View() string {
 	} else if m.showSidebar {
 		helpText = "↑/↓ or j/k: navigate | enter: select | [/esc: close"
 	} else {
-		helpText = "[: books | v: verse picker | /: search | c: compare | t: translation | T: theme | d: download | y: yank | n/pgdn: next | p/pgup: prev | q: quit"
+		helpText = "[: books | v: verse picker | /: search | c: compare | t: translation | T: theme | d: download | y: yank | n/pgdn: next | p/pgup: prev | ?: about | q: quit"
 	}
 
 	// Calculate padding to right-align version
@@ -991,6 +1001,10 @@ func (m Model) View() string {
 
 	if m.mode == modeCacheManager {
 		return m.renderCacheManager(header, help, errorMsg)
+	}
+
+	if m.mode == modeAbout {
+		return m.renderAbout(header, help, errorMsg)
 	}
 
 	if m.showMillerColumns {
@@ -2262,4 +2276,79 @@ func parseReference(ref string, books []api.Book) (book, chapter, verseStart, ve
 	}
 
 	return book, chapter, verseStart, verseEnd, nil
+}
+
+func (m Model) renderAbout(header, help, errorMsg string) string {
+	containerStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(m.currentTheme.BorderActive).
+		Padding(1, 2).
+		Width(m.width - 4)
+
+	titleStyle := lipgloss.NewStyle().
+		Foreground(m.currentTheme.Accent).
+		Bold(true).
+		MarginBottom(1)
+
+	sectionStyle := lipgloss.NewStyle().
+		Foreground(m.currentTheme.Primary)
+
+	labelStyle := lipgloss.NewStyle().
+		Foreground(m.currentTheme.Secondary).
+		Bold(true)
+
+	valueStyle := lipgloss.NewStyle().
+		Foreground(m.currentTheme.Primary)
+
+	linkStyle := lipgloss.NewStyle().
+		Foreground(m.currentTheme.Accent).
+		Underline(true)
+
+	var content strings.Builder
+
+	// Title
+	content.WriteString(titleStyle.Render("sword-tui") + "\n")
+	content.WriteString(sectionStyle.Render("A terminal-based Bible application") + "\n\n")
+
+	// Version info
+	content.WriteString(labelStyle.Render("Version: ") + valueStyle.Render(version.Version) + "\n")
+	content.WriteString(labelStyle.Render("Build: ") + valueStyle.Render(version.BuildNumber) + "\n\n")
+
+	// Repository
+	content.WriteString(labelStyle.Render("Repository: ") + linkStyle.Render("https://github.com/kmf/sword-tui") + "\n\n")
+
+	// API
+	content.WriteString(labelStyle.Render("API: ") + valueStyle.Render("bolls.life") + "\n")
+	content.WriteString(sectionStyle.Render("  https://bolls.life/api/") + "\n\n")
+
+	// License
+	content.WriteString(labelStyle.Render("License: ") + valueStyle.Render("GPL-2.0-or-later") + "\n\n")
+
+	// Keyboard shortcuts section
+	content.WriteString(titleStyle.Render("Keyboard Shortcuts") + "\n\n")
+
+	shortcuts := []struct {
+		key  string
+		desc string
+	}{
+		{"[", "Toggle books sidebar"},
+		{"v", "Open verse picker"},
+		{"/", "Search for verse"},
+		{"c", "Compare translations"},
+		{"t", "Select translation"},
+		{"T", "Select theme"},
+		{"d", "Download translations"},
+		{"y", "Yank/copy verse"},
+		{"n / PgDn", "Next chapter"},
+		{"p / PgUp", "Previous chapter"},
+		{"?", "Show this about page"},
+		{"q", "Quit"},
+	}
+
+	for _, s := range shortcuts {
+		content.WriteString(labelStyle.Render(s.key) + " - " + sectionStyle.Render(s.desc) + "\n")
+	}
+
+	listContent := containerStyle.Render(content.String())
+	return fmt.Sprintf("%s\n%s\n%s%s", header, listContent, help, errorMsg)
 }
