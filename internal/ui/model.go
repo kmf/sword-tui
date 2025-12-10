@@ -674,7 +674,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.showSidebar = false
 				return m, nil
 			}
-			if m.mode == modeSearch || m.mode == modeTranslationSelect || m.mode == modeThemeSelect || m.mode == modeAbout {
+			if m.mode == modeSearch || m.mode == modeTranslationSelect || m.mode == modeThemeSelect || m.mode == modeAbout || m.mode == modeComparison {
 				m.mode = modeReader
 				return m, nil
 			}
@@ -963,6 +963,8 @@ func (m Model) View() string {
 		helpText = "↑/↓ or j/k: navigate | enter: download | x: delete | esc: close"
 	} else if m.mode == modeAbout {
 		helpText = "esc: close"
+	} else if m.mode == modeComparison {
+		helpText = "↑/↓ or j/k: scroll | r/esc: return to reader"
 	} else if m.showMillerColumns && m.millerFilterMode {
 		helpText = "Type to filter | enter/esc: exit filter mode"
 	} else if m.showMillerColumns {
