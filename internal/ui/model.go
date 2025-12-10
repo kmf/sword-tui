@@ -1040,8 +1040,11 @@ func (m Model) calculateHighlightedVerse() int {
 
 		// Calculate available width
 		textWidth := m.width - 10
-		if textWidth < 40 {
-			textWidth = 40
+		if textWidth < 20 {
+			textWidth = 20
+		}
+		if textWidth > m.width-2 {
+			textWidth = m.width - 2
 		}
 
 		// Calculate how many lines this verse takes
@@ -1104,8 +1107,11 @@ func (m *Model) scrollToHighlightedVerse() {
 		indent := len(verseNumStr) + 2
 
 		textWidth := m.width - 10
-		if textWidth < 40 {
-			textWidth = 40
+		if textWidth < 20 {
+			textWidth = 20
+		}
+		if textWidth > m.width-2 {
+			textWidth = m.width - 2
 		}
 
 		wrappedText := wrapTextWithIndent(text, textWidth, indent)
@@ -1789,8 +1795,12 @@ func (m Model) formatChapter(verses []api.Verse, bookName string, chapter int, w
 	// Calculate available width for text (accounting for verse number and spacing)
 	// Verse number is right-aligned in 4 chars + 2 spaces = 6 chars total
 	textWidth := width - 6
-	if textWidth < 40 {
-		textWidth = 40 // Minimum width
+	if textWidth < 20 {
+		textWidth = 20 // Minimum width for readability
+	}
+	// Ensure we don't exceed actual terminal width
+	if textWidth > width-2 {
+		textWidth = width - 2
 	}
 
 	// Track if we're currently in a highlighted range
@@ -1967,8 +1977,12 @@ func (m Model) formatParallelVerses(versesMap map[string][]api.Verse, translatio
 
 	// Calculate available width for text (accounting for translation label)
 	textWidth := width - 15 // Reserve space for [TRANS] label and padding
-	if textWidth < 40 {
-		textWidth = 40 // Minimum width
+	if textWidth < 20 {
+		textWidth = 20 // Minimum width for readability
+	}
+	// Ensure we don't exceed actual terminal width
+	if textWidth > width-2 {
+		textWidth = width - 2
 	}
 
 	// Get max verses from any translation
