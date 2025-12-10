@@ -6,7 +6,7 @@ A terminal-based Bible application built with Go, bubbletea, and lipgloss.
 
 ### Navigation
 - **Miller Columns Interface**: Three-column navigation system (Books → Chapters → Verses)
-- **Sidebar Toggle**: Show/hide sidebar with `Tab` key
+- **Sidebar Toggle**: Show/hide sidebar with `[` key
 - **Verse Picker**: Quick verse navigation with filtering capability
 - **Keyboard-Driven**: Full keyboard navigation with vim-like bindings
 
@@ -58,7 +58,7 @@ yay -S sword-tui
 
 ### Keyboard Shortcuts
 
-- `Tab` - Toggle sidebar
+- `[` - Toggle books sidebar
 - `/` - Filter/search verses
 - `y` - Yank/copy selected verse
 - `j/k` - Navigate down/up
