@@ -462,7 +462,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, loadParallelVerses(m.client, m.comparisonTranslations, m.currentBook, m.currentChapter, verses)
 			}
 		case "r":
-			if m.mode != modeReader {
+			// Don't intercept 'r' when typing in word search input
+			if m.mode == modeWordSearch && m.wordSearchResults == nil && !m.wordSearchLoading {
+				// Let it pass through to input handling
+			} else if m.mode != modeReader {
 				m.mode = modeReader
 				return m, nil
 			}
