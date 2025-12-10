@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 )
 
@@ -64,6 +65,12 @@ type ParallelVerseRequest struct {
 	Verses       []int    `json:"verses"`
 	Chapter      int      `json:"chapter"`
 	Book         int      `json:"book"`
+}
+
+type SearchResponse struct {
+	ExactMatches int     `json:"exact_matches"`
+	Total        int     `json:"total"`
+	Results      []Verse `json:"results"`
 }
 
 func (c *Client) GetTranslations() ([]Translation, error) {
@@ -202,4 +209,32 @@ func (c *Client) GetParallelVerses(req ParallelVerseRequest) (map[string][]Verse
 	}
 
 	return result, nil
+}
+
+func (c *Client) SearchVerses(translation, query string) (*SearchResponse, error) {
+	// Build URL with query parameters
+	searchURL := fmt.Sprintf("%s/v2/find/%s", baseURL, translation)
+	params := url.Values{}
+	params.Set("search", query)
+	params.Set("limit", "500") // Get more results
+
+	fullURL := searchURL + "?" + params.Encode()
+
+	resp, err := c.httpClient.Get(fullURL)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var searchResp SearchResponse
+	if err := json.NewDecoder(resp.Body).Decode(&searchResp); err != nil {
+		return nil, err
+	}
+
+	return &searchResp, nil
 }

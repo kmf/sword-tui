@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sword-tui/internal/api"
@@ -27,6 +28,7 @@ const (
 	modeCacheManager
 	modeThemeSelect
 	modeAbout
+	modeWordSearch
 )
 
 type Model struct {
@@ -74,6 +76,13 @@ type Model struct {
 	// Theme state
 	currentTheme           theme.Theme
 	themeSelected          int
+	// Word search state
+	wordSearchInput        textinput.Model
+	wordSearchQuery        string
+	wordSearchResults      []api.Verse
+	wordSearchTotal        int
+	wordSearchSelected     int
+	wordSearchLoading      bool
 }
 
 type CacheInterface interface {
@@ -95,6 +104,11 @@ type parallelVersesLoadedMsg struct{ verses map[string][]api.Verse }
 type cacheListLoadedMsg struct{ translations []string }
 type downloadCompleteMsg struct{ translation string }
 type downloadErrorMsg struct{ translation string; err error }
+type searchResultsLoadedMsg struct {
+	results []api.Verse
+	total   int
+	query   string
+}
 
 func (e errMsg) Error() string { return e.err.Error() }
 
@@ -110,10 +124,16 @@ func NewModel() Model {
 	millerFilter.CharLimit = 50
 	millerFilter.Width = 25
 
+	wordSearch := textinput.New()
+	wordSearch.Placeholder = "Search the Bible..."
+	wordSearch.CharLimit = 100
+	wordSearch.Width = 50
+
 	return Model{
 		client:              api.NewClient(),
 		textInput:           ti,
 		millerFilterInput:   millerFilter,
+		wordSearchInput:     wordSearch,
 		selectedTranslation: "NLT",
 		currentBook:         1,
 		currentChapter:      1,
@@ -207,6 +227,20 @@ func downloadTranslation(cache CacheInterface, translation string) tea.Cmd {
 	}
 }
 
+func loadSearchResults(client *api.Client, translation, query string) tea.Cmd {
+	return func() tea.Msg {
+		resp, err := client.SearchVerses(translation, query)
+		if err != nil {
+			return errMsg{err}
+		}
+		return searchResultsLoadedMsg{
+			results: resp.Results,
+			total:   resp.Total,
+			query:   query,
+		}
+	}
+}
+
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	var cmds []tea.Cmd
@@ -271,7 +305,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case "up", "k":
-			if m.mode == modeTranslationSelect && m.translations != nil && m.translationSelected > 0 {
+			if m.mode == modeWordSearch && m.wordSearchResults != nil && m.wordSearchSelected > 0 {
+				m.wordSearchSelected--
+				return m, nil
+			} else if m.mode == modeTranslationSelect && m.translations != nil && m.translationSelected > 0 {
 				m.translationSelected--
 				return m, nil
 			} else if m.mode == modeThemeSelect && m.themeSelected > 0 {
@@ -321,7 +358,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case "down", "j":
-			if m.mode == modeTranslationSelect && m.translations != nil && m.translationSelected < len(m.translations)-1 {
+			if m.mode == modeWordSearch && m.wordSearchResults != nil && m.wordSearchSelected < len(m.wordSearchResults)-1 {
+				m.wordSearchSelected++
+				return m, nil
+			} else if m.mode == modeTranslationSelect && m.translations != nil && m.translationSelected < len(m.translations)-1 {
 				m.translationSelected++
 				return m, nil
 			} else if m.mode == modeThemeSelect && m.themeSelected < len(theme.AllThemes())-1 {
@@ -467,6 +507,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "?":
 			if m.mode == modeReader && !m.showSidebar {
 				m.mode = modeAbout
+				return m, nil
+			}
+		case "s":
+			if m.mode == modeReader && !m.showSidebar {
+				m.mode = modeWordSearch
+				m.wordSearchInput.SetValue("")
+				m.wordSearchInput.Focus()
+				m.wordSearchResults = nil
+				m.wordSearchSelected = 0
+				m.wordSearchLoading = false
 				return m, nil
 			}
 		case "n":
@@ -629,6 +679,35 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.textInput.SetValue("")
 					return m, loadChapter(m.client, m.selectedTranslation, m.currentBook, m.currentChapter)
 				}
+			} else if m.mode == modeWordSearch {
+				if m.wordSearchResults == nil && !m.wordSearchLoading {
+					// Submit search query
+					query := m.wordSearchInput.Value()
+					if query != "" {
+						m.wordSearchLoading = true
+						m.wordSearchInput.Blur()
+						return m, loadSearchResults(m.client, m.selectedTranslation, query)
+					}
+				} else if m.wordSearchResults != nil && len(m.wordSearchResults) > 0 {
+					// Navigate to selected result
+					result := m.wordSearchResults[m.wordSearchSelected]
+					m.currentBook = result.Book
+					m.currentChapter = result.Chapter
+					m.highlightedVerseStart = result.Verse
+					m.highlightedVerseEnd = result.Verse
+
+					// Look up the book name
+					for _, b := range m.books {
+						if b.BookID == result.Book {
+							m.currentBookName = b.Name
+							break
+						}
+					}
+
+					m.mode = modeReader
+					m.loading = true
+					return m, loadChapter(m.client, m.selectedTranslation, m.currentBook, m.currentChapter)
+				}
 			} else if m.mode == modeTranslationSelect {
 				// Simple translation selection (cycle through common ones)
 				translations := []string{"NLT", "KJV", "ASV", "WEB", "YLT", "DARBY"}
@@ -674,8 +753,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.showSidebar = false
 				return m, nil
 			}
-			if m.mode == modeSearch || m.mode == modeTranslationSelect || m.mode == modeThemeSelect || m.mode == modeAbout || m.mode == modeComparison {
+			if m.mode == modeSearch || m.mode == modeTranslationSelect || m.mode == modeThemeSelect || m.mode == modeAbout || m.mode == modeComparison || m.mode == modeWordSearch {
 				m.mode = modeReader
+				m.wordSearchResults = nil
+				m.wordSearchInput.SetValue("")
 				return m, nil
 			}
 		}
@@ -827,13 +908,35 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.downloadingTranslation = ""
 		m.err = msg.err
 
+	case searchResultsLoadedMsg:
+		m.wordSearchLoading = false
+		m.wordSearchResults = msg.results
+		m.wordSearchTotal = msg.total
+		m.wordSearchQuery = msg.query
+		m.wordSearchSelected = 0
+		// Sort results by book order
+		sort.Slice(m.wordSearchResults, func(i, j int) bool {
+			if m.wordSearchResults[i].Book != m.wordSearchResults[j].Book {
+				return m.wordSearchResults[i].Book < m.wordSearchResults[j].Book
+			}
+			if m.wordSearchResults[i].Chapter != m.wordSearchResults[j].Chapter {
+				return m.wordSearchResults[i].Chapter < m.wordSearchResults[j].Chapter
+			}
+			return m.wordSearchResults[i].Verse < m.wordSearchResults[j].Verse
+		})
+
 	case errMsg:
 		m.err = msg.err
 		m.loading = false
+		m.wordSearchLoading = false
 	}
 
 	if m.mode == modeSearch {
 		m.textInput, cmd = m.textInput.Update(msg)
+		cmds = append(cmds, cmd)
+	} else if m.mode == modeWordSearch && m.wordSearchResults == nil && !m.wordSearchLoading {
+		// Update word search input when typing query
+		m.wordSearchInput, cmd = m.wordSearchInput.Update(msg)
 		cmds = append(cmds, cmd)
 	} else if m.showMillerColumns && m.millerFilterMode {
 		// Update Miller filter input when in filter mode
@@ -911,6 +1014,8 @@ func (m Model) View() string {
 		header = headerStyle.Render(logoStyle.Render(logo) + " Download Translations")
 	} else if m.mode == modeAbout {
 		header = headerStyle.Render(logoStyle.Render(logo) + " About")
+	} else if m.mode == modeWordSearch {
+		header = headerStyle.Render(logoStyle.Render(logo) + " Search Bible")
 	} else {
 		// Check if current translation is cached
 		offlineIndicator := ""
@@ -963,6 +1068,12 @@ func (m Model) View() string {
 		helpText = "↑/↓ or j/k: navigate | enter: download | x: delete | esc: close"
 	} else if m.mode == modeAbout {
 		helpText = "esc: close"
+	} else if m.mode == modeWordSearch {
+		if m.wordSearchResults != nil {
+			helpText = "↑/↓ or j/k: navigate | enter: go to verse | esc: close"
+		} else {
+			helpText = "enter: search | esc: close"
+		}
 	} else if m.mode == modeComparison {
 		helpText = "↑/↓ or j/k: scroll | r/esc: return to reader"
 	} else if m.showMillerColumns && m.millerFilterMode {
@@ -972,7 +1083,7 @@ func (m Model) View() string {
 	} else if m.showSidebar {
 		helpText = "↑/↓ or j/k: navigate | enter: select | [/esc: close"
 	} else {
-		helpText = "[: books | v: verse picker | /: search | c: compare | t: translation | T: theme | d: download | y: yank | n/pgdn: next | p/pgup: prev | ?: about | q: quit"
+		helpText = "[: books | v: verse picker | /: search | s: word search | c: compare | t: translation | T: theme | d: download | y: yank | ?: about | q: quit"
 	}
 
 	// Calculate padding to right-align version
@@ -1007,6 +1118,10 @@ func (m Model) View() string {
 
 	if m.mode == modeAbout {
 		return m.renderAbout(header, help, errorMsg)
+	}
+
+	if m.mode == modeWordSearch {
+		return m.renderWordSearch(header, help, errorMsg)
 	}
 
 	if m.showMillerColumns {
@@ -2350,7 +2465,8 @@ func (m Model) renderAbout(header, help, errorMsg string) string {
 	}{
 		{"[", "Toggle books sidebar"},
 		{"v", "Open verse picker"},
-		{"/", "Search for verse"},
+		{"/", "Search for verse reference"},
+		{"s", "Search Bible for word/phrase"},
 		{"c", "Compare translations"},
 		{"t", "Select translation"},
 		{"T", "Select theme"},
@@ -2368,4 +2484,119 @@ func (m Model) renderAbout(header, help, errorMsg string) string {
 
 	listContent := containerStyle.Render(content.String())
 	return fmt.Sprintf("%s\n%s\n%s%s", header, listContent, help, errorMsg)
+}
+
+func (m Model) renderWordSearch(header, help, errorMsg string) string {
+	containerStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(m.currentTheme.BorderActive).
+		Padding(1, 2)
+
+	selectedStyle := lipgloss.NewStyle().
+		Foreground(m.currentTheme.Accent).
+		Background(m.currentTheme.Highlight).
+		Bold(true).
+		Padding(0, 1)
+
+	normalStyle := lipgloss.NewStyle().
+		Foreground(m.currentTheme.Primary).
+		Padding(0, 1)
+
+	verseNumStyle := lipgloss.NewStyle().
+		Foreground(m.currentTheme.Secondary).
+		Bold(true)
+
+	bookNameStyle := lipgloss.NewStyle().
+		Foreground(m.currentTheme.Accent)
+
+	var content strings.Builder
+
+	// Show search input if no results yet
+	if m.wordSearchResults == nil && !m.wordSearchLoading {
+		content.WriteString("Enter search term:\n\n")
+		content.WriteString(m.wordSearchInput.View())
+		content.WriteString("\n\nPress Enter to search, Esc to cancel")
+	} else if m.wordSearchLoading {
+		content.WriteString("Searching...")
+	} else if len(m.wordSearchResults) == 0 {
+		content.WriteString(fmt.Sprintf("No results found for \"%s\"", m.wordSearchQuery))
+		content.WriteString("\n\nPress Esc to go back")
+	} else {
+		// Show results count
+		content.WriteString(fmt.Sprintf("Found %d results for \"%s\" (showing %d)\n\n",
+			m.wordSearchTotal, m.wordSearchQuery, len(m.wordSearchResults)))
+
+		// Calculate visible window for virtual scrolling
+		visibleItems := m.height - 10
+		if visibleItems < 5 {
+			visibleItems = 5
+		}
+
+		startIdx := 0
+		if m.wordSearchSelected >= visibleItems {
+			startIdx = m.wordSearchSelected - visibleItems + 1
+		}
+		endIdx := startIdx + visibleItems
+		if endIdx > len(m.wordSearchResults) {
+			endIdx = len(m.wordSearchResults)
+		}
+
+		// Show "more above" indicator
+		if startIdx > 0 {
+			content.WriteString(fmt.Sprintf("  ... (%d more above)\n", startIdx))
+		}
+
+		// Group results by book for display
+		currentBook := -1
+		for i := startIdx; i < endIdx; i++ {
+			result := m.wordSearchResults[i]
+
+			// Show book header when book changes
+			if result.Book != currentBook {
+				currentBook = result.Book
+				bookName := m.getBookName(result.Book)
+				content.WriteString("\n" + bookNameStyle.Render(bookName) + "\n")
+			}
+
+			// Format verse reference
+			ref := fmt.Sprintf("%d:%d", result.Chapter, result.Verse)
+			verseText := stripHTMLTags(result.Text)
+
+			// Truncate long text
+			maxLen := m.width - 20
+			if maxLen < 30 {
+				maxLen = 30
+			}
+			if len(verseText) > maxLen {
+				verseText = verseText[:maxLen-3] + "..."
+			}
+
+			line := verseNumStyle.Render(ref) + " " + verseText
+
+			if i == m.wordSearchSelected {
+				content.WriteString(selectedStyle.Render("> "+line) + "\n")
+			} else {
+				content.WriteString(normalStyle.Render("  "+line) + "\n")
+			}
+		}
+
+		// Show "more below" indicator
+		if endIdx < len(m.wordSearchResults) {
+			content.WriteString(fmt.Sprintf("  ... (%d more below)\n", len(m.wordSearchResults)-endIdx))
+		}
+	}
+
+	listContent := containerStyle.Render(content.String())
+	return fmt.Sprintf("%s\n%s\n%s%s", header, listContent, help, errorMsg)
+}
+
+func (m Model) getBookName(bookID int) string {
+	if m.books != nil {
+		for _, book := range m.books {
+			if book.BookID == bookID {
+				return book.Name
+			}
+		}
+	}
+	return fmt.Sprintf("Book %d", bookID)
 }
