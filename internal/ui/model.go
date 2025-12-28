@@ -462,9 +462,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, loadParallelVerses(m.client, m.comparisonTranslations, m.currentBook, m.currentChapter, verses)
 			}
 		case "r":
-			// Don't intercept 'r' when typing in word search input
-			if m.mode == modeWordSearch && m.wordSearchResults == nil && !m.wordSearchLoading {
-				// Let it pass through to input handling
+			// Don't intercept 'r' when typing in search inputs
+			if m.mode == modeSearch {
+				// Let it pass through to verse reference input
+			} else if m.mode == modeWordSearch && m.wordSearchResults == nil && !m.wordSearchLoading {
+				// Let it pass through to word search input
 			} else if m.mode != modeReader {
 				m.mode = modeReader
 				return m, nil
@@ -1147,32 +1149,53 @@ func (m Model) calculateHighlightedVerse() int {
 		return 1
 	}
 
-	// Each verse takes approximately 3-4 lines (verse number + text + blank line)
-	// We'll calculate which verse is at the top of the viewport
+	// Calculate which verse is at the top of the viewport
 	yOffset := m.viewport.YOffset
+
+	// Calculate text width the same way formatChapter does
+	textWidth := m.width - 6
+	if textWidth < 20 {
+		textWidth = 20
+	}
+	if textWidth > m.width-2 {
+		textWidth = m.width - 2
+	}
 
 	// Count lines to find which verse we're at
 	currentLine := 0
-	for _, verse := range m.currentVerses {
+	indent := 6 // verse number width + 2 spaces
+
+	for i, verse := range m.currentVerses {
 		text := stripHTMLTags(verse.Text)
-		verseNumStr := fmt.Sprintf("%d", verse.Verse)
-		indent := len(verseNumStr) + 2
 
-		// Calculate available width
-		textWidth := m.width - 10
-		if textWidth < 20 {
-			textWidth = 20
+		// Check if this verse is highlighted (which would add a border)
+		isHighlighted := m.highlightedVerseStart > 0 && verse.Verse >= m.highlightedVerseStart && verse.Verse <= m.highlightedVerseEnd
+
+		// Check if next verse is also highlighted
+		nextIsHighlighted := false
+		if i+1 < len(m.currentVerses) {
+			nextVerse := m.currentVerses[i+1]
+			nextIsHighlighted = m.highlightedVerseStart > 0 && nextVerse.Verse >= m.highlightedVerseStart && nextVerse.Verse <= m.highlightedVerseEnd
 		}
-		if textWidth > m.width-2 {
-			textWidth = m.width - 2
+
+		var verseTotalLines int
+		if isHighlighted {
+			// Highlighted verses use narrower width due to border padding
+			wrappedText := wrapTextWithIndent(text, textWidth-4, indent)
+			linesInVerse := strings.Count(wrappedText, "\n") + 1
+
+			if !nextIsHighlighted {
+				// End of highlighted range - border adds 2 lines (top + bottom)
+				verseTotalLines = linesInVerse + 2 + 2
+			} else {
+				// Middle of highlighted range
+				verseTotalLines = linesInVerse + 1
+			}
+		} else {
+			wrappedText := wrapTextWithIndent(text, textWidth, indent)
+			linesInVerse := strings.Count(wrappedText, "\n") + 1
+			verseTotalLines = linesInVerse + 1
 		}
-
-		// Calculate how many lines this verse takes
-		wrappedText := wrapTextWithIndent(text, textWidth, indent)
-		linesInVerse := strings.Count(wrappedText, "\n") + 1
-
-		// Add verse number line + wrapped text lines + blank line
-		verseTotalLines := linesInVerse + 2
 
 		// If the current line + verse lines exceeds yOffset, this is our verse
 		if currentLine+verseTotalLines > yOffset {
@@ -1196,8 +1219,19 @@ func (m *Model) scrollToHighlightedVerse() {
 	}
 
 	// Calculate the line position of the highlighted verse
+	// This must match exactly how formatChapter renders verses
 	currentLine := 0
-	for _, verse := range m.currentVerses {
+
+	// Calculate text width the same way formatChapter does
+	textWidth := m.width - 6
+	if textWidth < 20 {
+		textWidth = 20
+	}
+	if textWidth > m.width-2 {
+		textWidth = m.width - 2
+	}
+
+	for i, verse := range m.currentVerses {
 		if verse.Verse == m.highlightedVerseStart {
 			// Found the verse, scroll to it
 			// Keep it near the top of the viewport (with some padding)
@@ -1221,24 +1255,41 @@ func (m *Model) scrollToHighlightedVerse() {
 			return
 		}
 
-		// Calculate lines for this verse
+		// Calculate lines for this verse - must match formatChapter logic
 		text := stripHTMLTags(verse.Text)
-		verseNumStr := fmt.Sprintf("%d", verse.Verse)
-		indent := len(verseNumStr) + 2
+		indent := 6 // verse number width + 2 spaces
 
-		textWidth := m.width - 10
-		if textWidth < 20 {
-			textWidth = 20
+		// Check if this verse is highlighted (which would add a border)
+		isHighlighted := m.highlightedVerseStart > 0 && verse.Verse >= m.highlightedVerseStart && verse.Verse <= m.highlightedVerseEnd
+
+		// Check if next verse is also highlighted
+		nextIsHighlighted := false
+		if i+1 < len(m.currentVerses) {
+			nextVerse := m.currentVerses[i+1]
+			nextIsHighlighted = m.highlightedVerseStart > 0 && nextVerse.Verse >= m.highlightedVerseStart && nextVerse.Verse <= m.highlightedVerseEnd
 		}
-		if textWidth > m.width-2 {
-			textWidth = m.width - 2
+
+		if isHighlighted {
+			// Highlighted verses use narrower width due to border padding
+			wrappedText := wrapTextWithIndent(text, textWidth-4, indent)
+			linesInVerse := strings.Count(wrappedText, "\n") + 1
+
+			if !nextIsHighlighted {
+				// End of highlighted range - border adds 2 lines (top + bottom)
+				// Plus verse lines, plus blank line after
+				verseTotalLines := linesInVerse + 2 + 2 // border top/bottom + blank line + content
+				currentLine += verseTotalLines
+			} else {
+				// Middle of highlighted range - just the verse text + blank line within border
+				verseTotalLines := linesInVerse + 1 // +1 for blank line between verses in border
+				currentLine += verseTotalLines
+			}
+		} else {
+			wrappedText := wrapTextWithIndent(text, textWidth, indent)
+			linesInVerse := strings.Count(wrappedText, "\n") + 1
+			verseTotalLines := linesInVerse + 1 // +1 for blank line after verse
+			currentLine += verseTotalLines
 		}
-
-		wrappedText := wrapTextWithIndent(text, textWidth, indent)
-		linesInVerse := strings.Count(wrappedText, "\n") + 1
-		verseTotalLines := linesInVerse + 2
-
-		currentLine += verseTotalLines
 	}
 }
 
@@ -1638,34 +1689,110 @@ func (m Model) renderSidebar() string {
 		Padding(0, 1).
 		Width(28)
 
+	moreStyle := lipgloss.NewStyle().
+		Foreground(m.currentTheme.Muted).
+		Italic(true).
+		Padding(0, 1)
+
 	var sb strings.Builder
-	sb.WriteString(sectionHeaderStyle.Render("OLD TESTAMENT") + "\n\n")
 
 	if m.books != nil {
-		// Old Testament (books 1-39)
+		// Calculate available height for book list
+		// Account for border (2), padding (2), and header lines
+		availableHeight := m.height - 8
+
+		// Build a combined list with section headers
+		type bookEntry struct {
+			isHeader    bool
+			headerText  string
+			bookIndex   int
+			book        api.Book
+		}
+
+		var entries []bookEntry
+
+		// Old Testament header
+		entries = append(entries, bookEntry{isHeader: true, headerText: "OLD TESTAMENT"})
+
+		// Old Testament books
 		for i, book := range m.books {
 			if book.BookID > 39 {
 				break
 			}
-			if i == m.sidebarSelected {
-				sb.WriteString(selectedStyle.Render("> "+book.Name) + "\n")
-			} else {
-				sb.WriteString(normalStyle.Render("  "+book.Name) + "\n")
-			}
+			entries = append(entries, bookEntry{isHeader: false, bookIndex: i, book: book})
 		}
 
-		sb.WriteString("\n" + sectionHeaderStyle.Render("NEW TESTAMENT") + "\n\n")
+		// New Testament header (with spacing)
+		entries = append(entries, bookEntry{isHeader: true, headerText: ""}) // blank line
+		entries = append(entries, bookEntry{isHeader: true, headerText: "NEW TESTAMENT"})
 
-		// New Testament (books 40-66)
+		// New Testament books
 		for i, book := range m.books {
 			if book.BookID < 40 {
 				continue
 			}
-			if i == m.sidebarSelected {
-				sb.WriteString(selectedStyle.Render("> "+book.Name) + "\n")
-			} else {
-				sb.WriteString(normalStyle.Render("  "+book.Name) + "\n")
+			entries = append(entries, bookEntry{isHeader: false, bookIndex: i, book: book})
+		}
+
+		// Find the entry index for the selected book
+		selectedEntryIdx := 0
+		for i, entry := range entries {
+			if !entry.isHeader && entry.bookIndex == m.sidebarSelected {
+				selectedEntryIdx = i
+				break
 			}
+		}
+
+		// Calculate virtual scroll window
+		totalEntries := len(entries)
+		visibleCount := availableHeight
+		if visibleCount < 5 {
+			visibleCount = 5
+		}
+		if visibleCount > totalEntries {
+			visibleCount = totalEntries
+		}
+
+		// Center the selected item in the visible window
+		startIdx := selectedEntryIdx - visibleCount/2
+		if startIdx < 0 {
+			startIdx = 0
+		}
+		endIdx := startIdx + visibleCount
+		if endIdx > totalEntries {
+			endIdx = totalEntries
+			startIdx = endIdx - visibleCount
+			if startIdx < 0 {
+				startIdx = 0
+			}
+		}
+
+		// Show "more above" indicator
+		if startIdx > 0 {
+			sb.WriteString(moreStyle.Render(fmt.Sprintf("... (%d more above)", startIdx)) + "\n")
+		}
+
+		// Render visible entries
+		for i := startIdx; i < endIdx; i++ {
+			entry := entries[i]
+			if entry.isHeader {
+				if entry.headerText == "" {
+					sb.WriteString("\n")
+				} else {
+					sb.WriteString(sectionHeaderStyle.Render(entry.headerText) + "\n")
+				}
+			} else {
+				if entry.bookIndex == m.sidebarSelected {
+					sb.WriteString(selectedStyle.Render("> "+entry.book.Name) + "\n")
+				} else {
+					sb.WriteString(normalStyle.Render("  "+entry.book.Name) + "\n")
+				}
+			}
+		}
+
+		// Show "more below" indicator
+		if endIdx < totalEntries {
+			sb.WriteString(moreStyle.Render(fmt.Sprintf("... (%d more below)", totalEntries-endIdx)) + "\n")
 		}
 	}
 
