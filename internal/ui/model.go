@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sword-tui/internal/api"
+	"sword-tui/internal/settings"
 	"sword-tui/internal/theme"
 	"sword-tui/internal/version"
 
@@ -56,33 +57,33 @@ type Model struct {
 	highlightedVerseStart  int // Start of highlighted verse range
 	highlightedVerseEnd    int // End of highlighted verse range
 	// Miller columns state
-	millerColumn           int // 0=books, 1=chapters, 2=verses
-	millerBookIdx          int
-	millerChapterIdx       int
-	millerVerseIdx         int
-	showMillerColumns      bool
-	millerFilterInput      textinput.Model
-	millerFilter           string
-	millerFilteredBooks    []api.Book
-	millerFilteredVerses   []api.Verse
-	millerFilterMode       bool // When true, all keys go to filter input
+	millerColumn         int // 0=books, 1=chapters, 2=verses
+	millerBookIdx        int
+	millerChapterIdx     int
+	millerVerseIdx       int
+	showMillerColumns    bool
+	millerFilterInput    textinput.Model
+	millerFilter         string
+	millerFilteredBooks  []api.Book
+	millerFilteredVerses []api.Verse
+	millerFilterMode     bool // When true, all keys go to filter input
 	// Cache management state
 	cache                  CacheInterface
 	cachedTranslations     []string
 	cacheSelected          int
 	downloadingTranslation string
 	// Translation selection state
-	translationSelected    int
+	translationSelected int
 	// Theme state
-	currentTheme           theme.Theme
-	themeSelected          int
+	currentTheme  theme.Theme
+	themeSelected int
 	// Word search state
-	wordSearchInput        textinput.Model
-	wordSearchQuery        string
-	wordSearchResults      []api.Verse
-	wordSearchTotal        int
-	wordSearchSelected     int
-	wordSearchLoading      bool
+	wordSearchInput    textinput.Model
+	wordSearchQuery    string
+	wordSearchResults  []api.Verse
+	wordSearchTotal    int
+	wordSearchSelected int
+	wordSearchLoading  bool
 }
 
 type CacheInterface interface {
@@ -96,14 +97,20 @@ type CacheInterface interface {
 	ClearCache() error
 }
 
-type errMsg struct{ err error }
-type translationsLoadedMsg struct{ translations []api.Translation }
-type booksLoadedMsg struct{ books []api.Book }
-type chapterLoadedMsg struct{ verses []api.Verse }
-type parallelVersesLoadedMsg struct{ verses map[string][]api.Verse }
-type cacheListLoadedMsg struct{ translations []string }
-type downloadCompleteMsg struct{ translation string }
-type downloadErrorMsg struct{ translation string; err error }
+type (
+	errMsg                  struct{ err error }
+	translationsLoadedMsg   struct{ translations []api.Translation }
+	booksLoadedMsg          struct{ books []api.Book }
+	chapterLoadedMsg        struct{ verses []api.Verse }
+	parallelVersesLoadedMsg struct{ verses map[string][]api.Verse }
+	cacheListLoadedMsg      struct{ translations []string }
+	downloadCompleteMsg     struct{ translation string }
+	downloadErrorMsg        struct {
+		translation string
+		err         error
+	}
+)
+
 type searchResultsLoadedMsg struct {
 	results []api.Verse
 	total   int
@@ -129,19 +136,48 @@ func NewModel() Model {
 	wordSearch.CharLimit = 100
 	wordSearch.Width = 50
 
+	// --- Load persisted settings (if any) ---
+	cfg, err := settings.Load()
+
+	selectedTranslation := "NLT"
+	currentBook := 1
+	currentChapter := 1
+	currentTheme := theme.CatppuccinMocha
+
+	if err == nil {
+		if cfg.SelectedTranslation != "" {
+			selectedTranslation = cfg.SelectedTranslation
+		}
+		if cfg.CurrentBook > 0 {
+			currentBook = cfg.CurrentBook
+		}
+		if cfg.CurrentChapter > 0 {
+			currentChapter = cfg.CurrentChapter
+		}
+		if cfg.CurrentTheme != "" {
+			// Match by display name against all known themes
+			for _, th := range theme.AllThemes() {
+				if th.Name == cfg.CurrentTheme {
+					currentTheme = th
+					break
+				}
+			}
+		}
+	}
+
 	return Model{
-		client:              api.NewClient(),
-		textInput:           ti,
-		millerFilterInput:   millerFilter,
-		wordSearchInput:     wordSearch,
-		selectedTranslation: "NLT",
-		currentBook:         1,
-		currentChapter:      1,
-		currentBookName:     "Genesis",
-		mode:                modeReader,
+		client:                 api.NewClient(),
+		textInput:              ti,
+		millerFilterInput:      millerFilter,
+		wordSearchInput:        wordSearch,
+		selectedTranslation:    selectedTranslation,
+		currentBook:            currentBook,
+		currentChapter:         currentChapter,
+		currentBookName:        "Genesis", // corrected after books load
+		mode:                   modeReader,
 		comparisonTranslations: []string{"NLT", "KJV", "WEB"},
-		currentTheme:        theme.CatppuccinMocha,
-		themeSelected:       0,
+		currentTheme:           currentTheme,
+		themeSelected:          0,
 	}
 }
 
@@ -249,7 +285,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "ctrl+c", "q":
-			return m, tea.Quit
+			return m, tea.Batch(
+				saveSettingsCmd(m),
+				tea.Quit,
+			)
 		case "[":
 			if m.mode == modeReader {
 				m.showSidebar = !m.showSidebar
@@ -1444,7 +1483,7 @@ func (m Model) renderMillerColumns() string {
 		Background(m.currentTheme.Background).
 		Bold(true).
 		Padding(0, 1).
-		Width(columnWidth-2)
+		Width(columnWidth - 2)
 
 	// Column 1: Books
 	var booksContent strings.Builder
@@ -1646,7 +1685,7 @@ func (m Model) renderMillerColumns() string {
 	statusBarStyle := lipgloss.NewStyle().
 		Foreground(m.currentTheme.Muted).
 		Background(m.currentTheme.Background).
-		Width(columnWidth * 3 + 6). // 3 columns + borders
+		Width(columnWidth*3+6). // 3 columns + borders
 		Align(lipgloss.Center).
 		Padding(0, 1)
 
@@ -1703,10 +1742,10 @@ func (m Model) renderSidebar() string {
 
 		// Build a combined list with section headers
 		type bookEntry struct {
-			isHeader    bool
-			headerText  string
-			bookIndex   int
-			book        api.Book
+			isHeader   bool
+			headerText string
+			bookIndex  int
+			book       api.Book
 		}
 
 		var entries []bookEntry
@@ -2288,12 +2327,12 @@ func stripHTMLTags(s string) string {
 	s = strings.ReplaceAll(s, "&quot;", "\"")
 	s = strings.ReplaceAll(s, "&#39;", "'")
 	s = strings.ReplaceAll(s, "&apos;", "'")
-	s = strings.ReplaceAll(s, "&ldquo;", "\u201C") // Left double quote
-	s = strings.ReplaceAll(s, "&rdquo;", "\u201D") // Right double quote
-	s = strings.ReplaceAll(s, "&lsquo;", "\u2018") // Left single quote
-	s = strings.ReplaceAll(s, "&rsquo;", "\u2019") // Right single quote
-	s = strings.ReplaceAll(s, "&mdash;", "\u2014") // Em dash
-	s = strings.ReplaceAll(s, "&ndash;", "\u2013") // En dash
+	s = strings.ReplaceAll(s, "&ldquo;", "\u201C")  // Left double quote
+	s = strings.ReplaceAll(s, "&rdquo;", "\u201D")  // Right double quote
+	s = strings.ReplaceAll(s, "&lsquo;", "\u2018")  // Left single quote
+	s = strings.ReplaceAll(s, "&rsquo;", "\u2019")  // Right single quote
+	s = strings.ReplaceAll(s, "&mdash;", "\u2014")  // Em dash
+	s = strings.ReplaceAll(s, "&ndash;", "\u2013")  // En dash
 	s = strings.ReplaceAll(s, "&hellip;", "\u2026") // Ellipsis
 
 	// Decode numeric HTML entities (e.g., &#8220; for left double quote)
@@ -2334,72 +2373,72 @@ func fuzzyMatchBook(query string, books []api.Book) (int, string, bool) {
 
 	// Book name abbreviations mapping
 	bookAbbrevs := map[string][]string{
-		"genesis": {"gen", "ge", "gn"},
-		"exodus": {"exo", "ex", "exod"},
-		"leviticus": {"lev", "le", "lv"},
-		"numbers": {"num", "nu", "nm", "nb"},
-		"deuteronomy": {"deut", "de", "dt"},
-		"joshua": {"josh", "jos", "jsh"},
-		"judges": {"judg", "jdg", "jg", "jdgs"},
-		"ruth": {"rut", "ru", "rth"},
-		"1 samuel": {"1sam", "1sa", "1samuel", "1 sam", "1 sa", "1s"},
-		"2 samuel": {"2sam", "2sa", "2samuel", "2 sam", "2 sa", "2s"},
-		"1 kings": {"1king", "1kgs", "1ki", "1k", "1 kings", "1 kgs"},
-		"2 kings": {"2king", "2kgs", "2ki", "2k", "2 kings", "2 kgs"},
-		"1 chronicles": {"1chron", "1chr", "1ch", "1 chronicles", "1 chr"},
-		"2 chronicles": {"2chron", "2chr", "2ch", "2 chronicles", "2 chr"},
-		"ezra": {"ezr", "ez"},
-		"nehemiah": {"neh", "ne"},
-		"esther": {"est", "es"},
-		"job": {"jb"},
-		"psalms": {"psalm", "psa", "ps", "pss"},
-		"proverbs": {"prov", "pro", "pr", "prv"},
-		"ecclesiastes": {"eccl", "ecc", "ec", "qoh"},
+		"genesis":         {"gen", "ge", "gn"},
+		"exodus":          {"exo", "ex", "exod"},
+		"leviticus":       {"lev", "le", "lv"},
+		"numbers":         {"num", "nu", "nm", "nb"},
+		"deuteronomy":     {"deut", "de", "dt"},
+		"joshua":          {"josh", "jos", "jsh"},
+		"judges":          {"judg", "jdg", "jg", "jdgs"},
+		"ruth":            {"rut", "ru", "rth"},
+		"1 samuel":        {"1sam", "1sa", "1samuel", "1 sam", "1 sa", "1s"},
+		"2 samuel":        {"2sam", "2sa", "2samuel", "2 sam", "2 sa", "2s"},
+		"1 kings":         {"1king", "1kgs", "1ki", "1k", "1 kings", "1 kgs"},
+		"2 kings":         {"2king", "2kgs", "2ki", "2k", "2 kings", "2 kgs"},
+		"1 chronicles":    {"1chron", "1chr", "1ch", "1 chronicles", "1 chr"},
+		"2 chronicles":    {"2chron", "2chr", "2ch", "2 chronicles", "2 chr"},
+		"ezra":            {"ezr", "ez"},
+		"nehemiah":        {"neh", "ne"},
+		"esther":          {"est", "es"},
+		"job":             {"jb"},
+		"psalms":          {"psalm", "psa", "ps", "pss"},
+		"proverbs":        {"prov", "pro", "pr", "prv"},
+		"ecclesiastes":    {"eccl", "ecc", "ec", "qoh"},
 		"song of solomon": {"song", "sos", "so", "canticle", "canticles", "song of songs"},
-		"isaiah": {"isa", "is"},
-		"jeremiah": {"jer", "je", "jr"},
-		"lamentations": {"lam", "la"},
-		"ezekiel": {"ezek", "eze", "ezk"},
-		"daniel": {"dan", "da", "dn"},
-		"hosea": {"hos", "ho"},
-		"joel": {"joe", "jl"},
-		"amos": {"amo", "am"},
-		"obadiah": {"obad", "ob"},
-		"jonah": {"jon", "jnh"},
-		"micah": {"mic", "mi"},
-		"nahum": {"nah", "na"},
-		"habakkuk": {"hab", "hb"},
-		"zephaniah": {"zeph", "zep", "zp"},
-		"haggai": {"hag", "hg"},
-		"zechariah": {"zech", "zec", "zc"},
-		"malachi": {"mal", "ml"},
-		"matthew": {"matt", "mat", "mt"},
-		"mark": {"mar", "mrk", "mk", "mr"},
-		"luke": {"luk", "lk"},
-		"john": {"joh", "jhn", "jn"},
-		"acts": {"act", "ac"},
-		"romans": {"rom", "ro", "rm"},
-		"1 corinthians": {"1cor", "1co", "1 corinthians", "1 cor"},
-		"2 corinthians": {"2cor", "2co", "2 corinthians", "2 cor"},
-		"galatians": {"gal", "ga"},
-		"ephesians": {"eph", "ephes"},
-		"philippians": {"phil", "php", "pp"},
-		"colossians": {"col", "co"},
+		"isaiah":          {"isa", "is"},
+		"jeremiah":        {"jer", "je", "jr"},
+		"lamentations":    {"lam", "la"},
+		"ezekiel":         {"ezek", "eze", "ezk"},
+		"daniel":          {"dan", "da", "dn"},
+		"hosea":           {"hos", "ho"},
+		"joel":            {"joe", "jl"},
+		"amos":            {"amo", "am"},
+		"obadiah":         {"obad", "ob"},
+		"jonah":           {"jon", "jnh"},
+		"micah":           {"mic", "mi"},
+		"nahum":           {"nah", "na"},
+		"habakkuk":        {"hab", "hb"},
+		"zephaniah":       {"zeph", "zep", "zp"},
+		"haggai":          {"hag", "hg"},
+		"zechariah":       {"zech", "zec", "zc"},
+		"malachi":         {"mal", "ml"},
+		"matthew":         {"matt", "mat", "mt"},
+		"mark":            {"mar", "mrk", "mk", "mr"},
+		"luke":            {"luk", "lk"},
+		"john":            {"joh", "jhn", "jn"},
+		"acts":            {"act", "ac"},
+		"romans":          {"rom", "ro", "rm"},
+		"1 corinthians":   {"1cor", "1co", "1 corinthians", "1 cor"},
+		"2 corinthians":   {"2cor", "2co", "2 corinthians", "2 cor"},
+		"galatians":       {"gal", "ga"},
+		"ephesians":       {"eph", "ephes"},
+		"philippians":     {"phil", "php", "pp"},
+		"colossians":      {"col", "co"},
 		"1 thessalonians": {"1thess", "1th", "1 thessalonians", "1 thess"},
 		"2 thessalonians": {"2thess", "2th", "2 thessalonians", "2 thess"},
-		"1 timothy": {"1tim", "1ti", "1 timothy", "1 tim"},
-		"2 timothy": {"2tim", "2ti", "2 timothy", "2 tim"},
-		"titus": {"tit", "ti"},
-		"philemon": {"philem", "phm", "pm"},
-		"hebrews": {"heb", "he"},
-		"james": {"jam", "jas", "jm"},
-		"1 peter": {"1pet", "1pe", "1pt", "1p", "1 peter", "1 pet"},
-		"2 peter": {"2pet", "2pe", "2pt", "2p", "2 peter", "2 pet"},
-		"1 john": {"1john", "1jn", "1jo", "1j", "1 john"},
-		"2 john": {"2john", "2jn", "2jo", "2j", "2 john"},
-		"3 john": {"3john", "3jn", "3jo", "3j", "3 john"},
-		"jude": {"jud", "jd"},
-		"revelation": {"rev", "re", "rv"},
+		"1 timothy":       {"1tim", "1ti", "1 timothy", "1 tim"},
+		"2 timothy":       {"2tim", "2ti", "2 timothy", "2 tim"},
+		"titus":           {"tit", "ti"},
+		"philemon":        {"philem", "phm", "pm"},
+		"hebrews":         {"heb", "he"},
+		"james":           {"jam", "jas", "jm"},
+		"1 peter":         {"1pet", "1pe", "1pt", "1p", "1 peter", "1 pet"},
+		"2 peter":         {"2pet", "2pe", "2pt", "2p", "2 peter", "2 pet"},
+		"1 john":          {"1john", "1jn", "1jo", "1j", "1 john"},
+		"2 john":          {"2john", "2jn", "2jo", "2j", "2 john"},
+		"3 john":          {"3john", "3jn", "3jo", "3j", "3 john"},
+		"jude":            {"jud", "jd"},
+		"revelation":      {"rev", "re", "rv"},
 	}
 
 	// Try exact match first
@@ -2729,4 +2768,20 @@ func (m Model) getBookName(bookID int) string {
 		}
 	}
 	return fmt.Sprintf("Book %d", bookID)
+}
+
+func saveSettingsCmd(m Model) tea.Cmd {
+	return func() tea.Msg {
+		// We persist the theme by its display Name,
+		// and resolve it again via AllThemes at startup.
+		cfg := settings.Settings{
+			SelectedTranslation: m.selectedTranslation,
+			CurrentBook:         m.currentBook,
+			CurrentChapter:      m.currentChapter,
+			CurrentTheme:        m.currentTheme.Name,
+		}
+
+		_ = settings.Save(cfg) // ignore errors on quit; fail-soft
+		return nil
+	}
 }
