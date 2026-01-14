@@ -285,10 +285,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "ctrl+c", "q":
-			return m, tea.Batch(
-				saveSettingsCmd(m),
-				tea.Quit,
-			)
+			// Save settings synchronously before quitting to avoid race condition
+			cfg := settings.Settings{
+				SelectedTranslation: m.selectedTranslation,
+				CurrentBook:         m.currentBook,
+				CurrentChapter:      m.currentChapter,
+				CurrentTheme:        m.currentTheme.Name,
+			}
+			_ = settings.Save(cfg)
+			return m, tea.Quit
 		case "[":
 			if m.mode == modeReader {
 				m.showSidebar = !m.showSidebar
@@ -2770,18 +2775,3 @@ func (m Model) getBookName(bookID int) string {
 	return fmt.Sprintf("Book %d", bookID)
 }
 
-func saveSettingsCmd(m Model) tea.Cmd {
-	return func() tea.Msg {
-		// We persist the theme by its display Name,
-		// and resolve it again via AllThemes at startup.
-		cfg := settings.Settings{
-			SelectedTranslation: m.selectedTranslation,
-			CurrentBook:         m.currentBook,
-			CurrentChapter:      m.currentChapter,
-			CurrentTheme:        m.currentTheme.Name,
-		}
-
-		_ = settings.Save(cfg) // ignore errors on quit; fail-soft
-		return nil
-	}
-}
