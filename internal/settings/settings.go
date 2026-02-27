@@ -6,11 +6,31 @@ import (
 	"path/filepath"
 )
 
+type Highlight struct {
+	VersePK int    `json:"verse_pk"`
+	Start   int    `json:"start"`
+	End     int    `json:"end"`
+	Color   string `json:"color"`
+}
+
+type Note struct {
+	Translation string `json:"translation"`
+	VersePK     int    `json:"verse_pk"`
+	WordIndex   int    `json:"word_index"` // Index of the word in the verse
+	Symbol      string `json:"symbol"`     // The symbol or number displayed
+	Text        string `json:"text"`       // The actual note content
+}
+
 type Settings struct {
-	SelectedTranslation string `json:"selected_translation"`
-	CurrentBook         int    `json:"current_book"`
-	CurrentChapter      int    `json:"current_chapter"`
-	CurrentTheme        string `json:"current_theme"` // theme display name
+	SelectedLanguage       string      `json:"selected_language"`
+	SelectedTranslation    string      `json:"selected_translation"`
+	CurrentBook            int         `json:"current_book"`
+	CurrentChapter         int         `json:"current_chapter"`
+	CurrentTheme           string      `json:"current_theme"` // theme display name
+	Highlights             []Highlight `json:"highlights"`
+	SelectedHighlightColor string      `json:"selected_highlight_color"`
+	Notes                  []Note      `json:"notes"`
+	SelectedSymbolStyle    string      `json:"selected_symbol_style"` // "numbers", "symbols", etc.
 }
 
 func configPath() (string, error) {
