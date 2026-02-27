@@ -13,12 +13,21 @@ type Highlight struct {
 	Color   string `json:"color"`
 }
 
-type Note struct {
+type Reference struct {
+	BookID      int    `json:"book_id"`
+	BookName    string `json:"book_name"`
+	Chapter     int    `json:"chapter"`
+	Verse       int    `json:"verse"`
 	Translation string `json:"translation"`
-	VersePK     int    `json:"verse_pk"`
-	WordIndex   int    `json:"word_index"` // Index of the word in the verse
-	Symbol      string `json:"symbol"`     // The symbol or number displayed
-	Text        string `json:"text"`       // The actual note content
+}
+
+type Note struct {
+	Translation string      `json:"translation"`
+	VersePK     int         `json:"verse_pk"`
+	WordIndex   int         `json:"word_index"` // Index of the word in the verse
+	Symbol      string      `json:"symbol"`     // The symbol or number displayed
+	Text        string      `json:"text"`       // The actual note content
+	References  []Reference `json:"references"`
 }
 
 type Settings struct {

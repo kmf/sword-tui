@@ -12,6 +12,7 @@ import (
 	"sword-tui/internal/version"
 
 	"github.com/atotto/clipboard"
+	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
@@ -35,6 +36,9 @@ const (
 	modeVerseHighlight
 	modeWordSelect
 	modeNoteInput
+	modeNoteSidebar
+	modeReferenceSelect
+	modeReferenceList
 )
 
 type Model struct {
@@ -96,8 +100,15 @@ type Model struct {
 	notes               []settings.Note
 	selectedSymbolStyle string
 	wordIndex           int // index of selected word in verse
-	noteInput           textinput.Model
+	noteInput           textarea.Model
 	showNoteSidebar     bool
+	noteSidebarSelected int
+	referenceListSelected int
+	tempReferences      []settings.Reference
+	originalBook        int
+	originalChapter     int
+	editingNoteVersePK  int
+	editingNoteWordIndex int
 	nKeyPending         bool
 	// Word search state
 	wordSearchInput    textinput.Model
@@ -160,10 +171,11 @@ func NewModel() Model {
 	wordSearch.CharLimit = 100
 	wordSearch.Width = 50
 
-	noteInput := textinput.New()
+	noteInput := textarea.New()
 	noteInput.Placeholder = "Enter note..."
 	noteInput.CharLimit = 500
-	noteInput.Width = 30
+	noteInput.SetWidth(30)
+	noteInput.SetHeight(5)
 
 	// --- Load persisted settings (if any) ---
 	cfg, err := settings.Load()
@@ -387,6 +399,75 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 			}
+		case "ctrl+r":
+			if m.mode == modeNoteInput {
+				m.originalBook = m.currentBook
+				m.originalChapter = m.currentChapter
+				m.mode = modeReferenceSelect
+				m.showMillerColumns = true
+				m.millerColumn = 0
+				return m, nil
+			}
+		case "ctrl+enter", "ctrl+l", "ctrl+j", "ctrl+m", "g":
+			if m.mode == modeNoteSidebar {
+				notes := m.getChapterNotes()
+				if len(notes) > 0 && m.noteSidebarSelected < len(notes) {
+					note := notes[m.noteSidebarSelected]
+					if len(note.References) == 1 {
+						// Single reference, go directly
+						ref := note.References[0]
+						m.originalBook = m.currentBook
+						m.originalChapter = m.currentChapter
+						m.currentBook = ref.BookID
+						m.currentBookName = ref.BookName
+						m.currentChapter = ref.Chapter
+						m.highlightedVerseStart = ref.Verse
+						m.highlightedVerseEnd = ref.Verse
+						m.mode = modeReader
+						m.loading = true
+						return m, loadChapter(m.client, m.selectedTranslation, m.currentBook, m.currentChapter)
+					} else if len(note.References) > 1 {
+						// Multiple references, show selection list
+						m.originalBook = m.currentBook
+						m.originalChapter = m.currentChapter
+						m.mode = modeReferenceList
+						m.referenceListSelected = 0
+						return m, nil
+					}
+				}
+			}
+		case "a":
+			if m.mode == modeNoteSidebar {
+				m.mode = modeWordSelect
+				m.wordIndex = 0
+				return m, nil
+			}
+		case "d":
+			if m.mode == modeNoteSidebar {
+				notes := m.getChapterNotes()
+				if len(notes) > 0 && m.noteSidebarSelected < len(notes) {
+					noteToDelete := notes[m.noteSidebarSelected]
+					// Remove from m.notes
+					for i, n := range m.notes {
+						if n.VersePK == noteToDelete.VersePK && n.WordIndex == noteToDelete.WordIndex && n.Translation == noteToDelete.Translation {
+							m.notes = append(m.notes[:i], m.notes[i+1:]...)
+							break
+						}
+					}
+					if m.noteSidebarSelected > 0 && m.noteSidebarSelected >= len(m.getChapterNotes()) {
+						m.noteSidebarSelected--
+					}
+				}
+				return m, nil
+			}
+			if m.mode == modeReader && !m.showSidebar {
+				m.mode = modeCacheManager
+				m.cacheSelected = 0
+				if m.cache != nil {
+					return m, loadCachedList(m.cache)
+				}
+				return m, nil
+			}
 		case "ctrl+c", "q":
 			// Save settings synchronously before quitting to avoid race condition
 			cfg := settings.Settings{
@@ -491,6 +572,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case "up", "k":
+			if m.mode == modeNoteSidebar {
+				if m.noteSidebarSelected > 0 {
+					m.noteSidebarSelected--
+				}
+				return m, nil
+			}
+			if m.mode == modeReferenceList {
+				if m.referenceListSelected > 0 {
+					m.referenceListSelected--
+				}
+				return m, nil
+			}
 			if m.mode == modeVerseHighlight {
 				m.verseCursorPos -= 10 // Page-like jump in verse
 				if m.verseCursorPos < 0 { m.verseCursorPos = 0 }
@@ -567,6 +660,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case "down", "j":
+			if m.mode == modeNoteSidebar {
+				notes := m.getChapterNotes()
+				if m.noteSidebarSelected < len(notes)-1 {
+					m.noteSidebarSelected++
+				}
+				return m, nil
+			}
+			if m.mode == modeReferenceList {
+				notes := m.getChapterNotes()
+				if m.noteSidebarSelected < len(notes) {
+					note := notes[m.noteSidebarSelected]
+					if m.referenceListSelected < len(note.References)-1 {
+						m.referenceListSelected++
+					}
+				}
+				return m, nil
+			}
 			if m.mode == modeVerseHighlight {
 				var currentText string
 				for _, v := range m.currentVerses {
@@ -816,9 +926,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.viewport.SetContent(m.content)
 				return m, nil
 			}
-			// Don't intercept 'r' when typing in search inputs
+			// Don't intercept 'r' when typing in search inputs or notes
 			if m.mode == modeSearch {
 				// Let it pass through to verse reference input
+			} else if m.mode == modeNoteInput {
+				// Let it pass through to note input
 			} else if m.mode == modeWordSearch && m.wordSearchResults == nil && !m.wordSearchLoading {
 				// Let it pass through to word search input
 			} else if m.mode != modeReader {
@@ -854,15 +966,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 			}
-		case "d":
-			if m.mode == modeReader && !m.showSidebar {
-				m.mode = modeCacheManager
-				m.cacheSelected = 0
-				if m.cache != nil {
-					return m, loadCachedList(m.cache)
-				}
-				return m, nil
-			}
 		case "?":
 			if m.mode == modeReader && !m.showSidebar {
 				m.mode = modeAbout
@@ -870,12 +973,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "n":
 			if m.mode == modeReader && !m.showSidebar && !m.showMillerColumns {
-				m.mode = modeWordSelect
-				m.wordIndex = 0
-				m.nKeyPending = false // Reset pending state
-				// Refresh to show selection
-				m.content = m.formatChapter(m.currentVerses, m.currentBookName, m.currentChapter, m.width, m.highlightedVerseStart, m.highlightedVerseEnd)
-				m.viewport.SetContent(m.content)
+				m.mode = modeNoteSidebar
+				m.noteSidebarSelected = 0
+				return m, nil
+			}
+			if m.mode == modeNoteSidebar {
+				// While in sidebar, n could still mean go to word select if no notes exist
+				// but let's stick to 'a' for add in sidebar mode as per help text
 				return m, nil
 			}
 			// Fallback to next chapter for 'n' if not in reader mode or overlays open
@@ -974,6 +1078,47 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, loadChapter(m.client, m.selectedTranslation, m.currentBook, m.currentChapter)
 			}
 		case "enter":
+			if m.mode == modeNoteSidebar {
+				notes := m.getChapterNotes()
+				if len(notes) > 0 && m.noteSidebarSelected < len(notes) {
+					note := notes[m.noteSidebarSelected]
+					m.mode = modeNoteInput
+					m.wordIndex = note.WordIndex
+					m.editingNoteVersePK = note.VersePK
+					m.editingNoteWordIndex = note.WordIndex
+					// We need to set highlightedVerseStart to match the note's verse
+					for _, v := range m.currentVerses {
+						if v.PK == note.VersePK {
+							m.highlightedVerseStart = v.Verse
+							m.highlightedVerseEnd = v.Verse
+							break
+						}
+					}
+					m.noteInput.Focus()
+					m.noteInput.SetValue(note.Text)
+					m.noteInput.SetWidth(m.width - 10)
+					m.tempReferences = append([]settings.Reference{}, note.References...)
+				}
+				return m, nil
+			}
+			if m.mode == modeReferenceList {
+				notes := m.getChapterNotes()
+				if len(notes) > 0 && m.noteSidebarSelected < len(notes) {
+					note := notes[m.noteSidebarSelected]
+					if m.referenceListSelected < len(note.References) {
+						ref := note.References[m.referenceListSelected]
+						m.currentBook = ref.BookID
+						m.currentBookName = ref.BookName
+						m.currentChapter = ref.Chapter
+						m.highlightedVerseStart = ref.Verse
+						m.highlightedVerseEnd = ref.Verse
+						m.mode = modeReader
+						m.loading = true
+						return m, loadChapter(m.client, m.selectedTranslation, m.currentBook, m.currentChapter)
+					}
+				}
+				return m, nil
+			}
 			if m.hKeyPending {
 				m.hKeyPending = false
 				m.mode = modeVerseHighlight
@@ -991,8 +1136,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// Transition to note input for selected word
 				m.mode = modeNoteInput
 				m.noteInput.Focus()
+				m.noteInput.SetWidth(m.width - 10)
 				// Load existing note if any
 				m.noteInput.SetValue("")
+				m.tempReferences = nil
 				var versePK int
 				for _, v := range m.currentVerses {
 					if v.Verse == m.highlightedVerseStart {
@@ -1000,56 +1147,63 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						break
 					}
 				}
+				m.editingNoteVersePK = versePK
+				m.editingNoteWordIndex = m.wordIndex
 				for _, note := range m.notes {
 					if note.VersePK == versePK && note.WordIndex == m.wordIndex && note.Translation == m.selectedTranslation {
 						m.noteInput.SetValue(note.Text)
+						m.tempReferences = append([]settings.Reference{}, note.References...)
 						break
 					}
 				}
 				return m, nil
 			}
 			if m.mode == modeNoteInput {
-				// Save note
-				var versePK int
-				for _, v := range m.currentVerses {
-					if v.Verse == m.highlightedVerseStart {
-						versePK = v.PK
-						break
-					}
-				}
+				// Save note using the preserved context
+				versePK := m.editingNoteVersePK
+				wordIdx := m.editingNoteWordIndex
 				
 				noteText := strings.TrimSpace(m.noteInput.Value())
 				
-				// Update existing, add new, or remove if empty
-				found := false
-				for i, note := range m.notes {
-					if note.VersePK == versePK && note.WordIndex == m.wordIndex && note.Translation == m.selectedTranslation {
-						if noteText == "" {
-							// Remove the note
-							m.notes = append(m.notes[:i], m.notes[i+1:]...)
-						} else {
-							// Update the note
-							m.notes[i].Text = noteText
-						}
-						found = true
-						break
+				// Precise one-to-one synchronization of m.tempReferences with noteText
+				// This handles multiple identical references correctly.
+				var finalRefs []settings.Reference
+				remainingText := noteText
+				for _, ref := range m.tempReferences {
+					refStr := fmt.Sprintf("(%s %d:%d)", ref.BookName, ref.Chapter, ref.Verse)
+					if strings.Contains(remainingText, refStr) {
+						finalRefs = append(finalRefs, ref)
+						// Remove only the FIRST occurrence of this ref from remainingText 
+						// so we don't match it again for duplicate structured refs
+						remainingText = strings.Replace(remainingText, refStr, "", 1)
 					}
 				}
+				m.tempReferences = finalRefs
+
+				// Clean up any existing notes for this same word to prevent duplicates/ghost text
+				var filteredNotes []settings.Note
+				for _, note := range m.notes {
+					if note.VersePK == versePK && note.WordIndex == wordIdx && note.Translation == m.selectedTranslation {
+						continue
+					}
+					filteredNotes = append(filteredNotes, note)
+				}
+				m.notes = filteredNotes
 				
-				if !found && noteText != "" {
-					// Add new note only if text is not empty
+				// Add the updated/new note if not empty
+				if noteText != "" || len(m.tempReferences) > 0 {
 					m.notes = append(m.notes, settings.Note{
 						Translation: m.selectedTranslation,
 						VersePK:     versePK,
-						WordIndex:   m.wordIndex,
-						Symbol:      "*", // Default symbol for now
+						WordIndex:   wordIdx,
+						Symbol:      "*",
 						Text:        noteText,
+						References:  m.tempReferences,
 					})
 				}
 				
-				m.mode = modeReader
-				m.content = m.formatChapter(m.currentVerses, m.currentBookName, m.currentChapter, m.width, m.highlightedVerseStart, m.highlightedVerseEnd)
-				m.viewport.SetContent(m.content)
+				m.mode = modeNoteSidebar
+				m.noteSidebarSelected = 0
 				return m, nil
 			}
 			if m.mode == modeVerseHighlight {
@@ -1122,7 +1276,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.millerFilterInput.Blur()
 				return m, nil
 			} else if m.showMillerColumns && m.books != nil && m.currentVerses != nil {
-				// Navigate to the selected verse
+				// Navigate or select reference
 				booksToUse := m.books
 				if m.millerFilter != "" && m.millerFilteredBooks != nil {
 					booksToUse = m.millerFilteredBooks
@@ -1130,6 +1284,41 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.millerBookIdx < len(booksToUse) {
 					selectedBook := booksToUse[m.millerBookIdx]
 					selectedChapter := m.millerChapterIdx + 1
+					
+					if m.mode == modeReferenceSelect {
+						// Add reference instead of navigating
+						versesToUse := m.currentVerses
+						if m.millerFilter != "" && m.millerFilteredVerses != nil {
+							versesToUse = m.millerFilteredVerses
+						}
+						
+						if m.millerVerseIdx < len(versesToUse) {
+							verse := versesToUse[m.millerVerseIdx].Verse
+							ref := settings.Reference{
+								BookID:      selectedBook.BookID,
+								BookName:    selectedBook.Name,
+								Chapter:     selectedChapter,
+								Verse:       verse,
+								Translation: m.selectedTranslation,
+							}
+							m.tempReferences = append(m.tempReferences, ref)
+							
+							// Also append a text representation to the note
+							refText := fmt.Sprintf("(%s %d:%d)", ref.BookName, ref.Chapter, ref.Verse)
+							m.noteInput.SetValue(m.noteInput.Value() + refText)
+							m.noteInput.CursorEnd()
+							
+							m.mode = modeNoteInput
+							m.noteInput.SetWidth(m.width - 10)
+							m.showMillerColumns = false
+							// Restore original position
+							m.currentBook = m.originalBook
+							m.currentChapter = m.originalChapter
+							m.loading = true
+							return m, loadChapter(m.client, m.selectedTranslation, m.currentBook, m.currentChapter)
+						}
+					}
+
 					m.currentBook = selectedBook.BookID
 					m.currentBookName = selectedBook.Name
 					m.currentChapter = selectedChapter
@@ -1233,14 +1422,37 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "esc":
 			m.hKeyPending = false
 			m.nKeyPending = false
-			if m.mode == modeCacheManager {
+			if m.mode == modeReferenceSelect {
+				m.mode = modeNoteInput
+				m.noteInput.SetWidth(m.width - 10)
+				m.showMillerColumns = false
+				// Restore original position
+				m.currentBook = m.originalBook
+				m.currentChapter = m.originalChapter
+				m.loading = true
+				return m, loadChapter(m.client, m.selectedTranslation, m.currentBook, m.currentChapter)
+			}
+			if m.mode == modeReferenceList {
+				m.mode = modeNoteSidebar
+				return m, nil
+			}
+			if m.mode == modeNoteSidebar {
 				m.mode = modeReader
 				return m, nil
 			}
-			if m.mode == modeVerseHighlight || m.mode == modeHighlightSettings || m.mode == modeWordSelect || m.mode == modeNoteInput {
-				m.mode = modeReader
+			if m.mode == modeWordSelect || m.mode == modeNoteInput {
+				notes := m.getChapterNotes()
+				if len(notes) > 0 {
+					m.mode = modeNoteSidebar
+				} else {
+					m.mode = modeReader
+				}
 				m.content = m.formatChapter(m.currentVerses, m.currentBookName, m.currentChapter, m.width, m.highlightedVerseStart, m.highlightedVerseEnd)
 				m.viewport.SetContent(m.content)
+				return m, nil
+			}
+			if m.mode == modeCacheManager {
+				m.mode = modeReader
 				return m, nil
 			}
 			if m.showMillerColumns && m.millerFilterMode {
@@ -1674,6 +1886,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 
+		// Update note input width
+		m.noteInput.SetWidth(m.width - 10)
+
 		if !m.ready {
 			m.viewport = viewport.New(msg.Width, msg.Height-6)
 			m.viewport.YPosition = 4
@@ -1710,8 +1925,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.loading = false
 		m.currentVerses = msg.verses
 		m.currentParallelVerses = nil
-		// Track if we came from a search (highlighted verse was set)
-		cameFromSearch := m.highlightedVerseStart > 1
+		// Track if we came from a search or reference (highlighted verse was set)
+		cameFromSearch := m.highlightedVerseStart > 0
 		// Initialize highlighted verse to first verse or use the range from search
 		if m.highlightedVerseStart == 0 {
 			if len(msg.verses) > 0 {
@@ -1875,6 +2090,10 @@ func (m Model) View() string {
 		header = headerStyle.Render(logoStyle.Render(logo) + " About")
 	} else if m.mode == modeWordSearch {
 		header = headerStyle.Render(logoStyle.Render(logo) + " Search Bible")
+	} else if m.mode == modeReferenceSelect {
+		header = headerStyle.Render(logoStyle.Render(logo) + " Select Reference for Note")
+	} else if m.mode == modeReferenceList {
+		header = headerStyle.Render(logoStyle.Render(logo) + " Select Reference to Navigate")
 	} else {
 		// Check if current translation is cached
 		offlineIndicator := ""
@@ -1926,7 +2145,7 @@ func (m Model) View() string {
 	} else if m.mode == modeWordSelect {
 		helpText = "h/l: select word | enter: add/edit note | esc: cancel"
 	} else if m.mode == modeNoteInput {
-		helpText = "type note... | enter: save | esc: cancel"
+		helpText = "type note... | ctrl+r: add ref | enter: save | esc: cancel"
 	} else if m.mode == modeLanguageSelect {
 		helpText = "↑/↓ or j/k: navigate | enter: select | esc: close"
 	} else if m.mode == modeTranslationSelect {
@@ -1948,11 +2167,17 @@ func (m Model) View() string {
 	} else if m.showMillerColumns && m.millerFilterMode {
 		helpText = "Type to filter | enter/esc: exit filter mode"
 	} else if m.showMillerColumns {
-		helpText = "↑/↓ or j/k: navigate | ←/→ or h/l: switch column | /: filter | enter: select | v/esc: close"
+		if m.mode == modeReferenceSelect {
+			helpText = "↑/↓ or j/k: navigate | ←/→ or h/l: switch column | enter: select reference | esc: cancel"
+		} else {
+			helpText = "↑/↓ or j/k: navigate | ←/→ or h/l: switch column | /: filter | enter: select | v/esc: close"
+		}
 	} else if m.showSidebar {
 		helpText = "↑/↓ or j/k: navigate | enter: select | [/esc: close"
+	} else if m.mode == modeNoteSidebar || m.mode == modeReferenceList {
+		helpText = "↑/↓ or j/k: navigate | enter: edit | g: go to ref | a: add | d: delete | esc: back"
 	} else {
-		helpText = "[: books | v: verse picker | /: search | s: word search | c: compare | l: language | t: translation | T: theme | d: download | h: highlight | n: note | y: yank | ?: about | q: quit"
+		helpText = "[: books | v: verse picker | /: search | s: word search | c: compare | l: language | t: translation | T: theme | d: download | h: highlight | n: notes | y: yank | ?: about | q: quit"
 	}
 
 	// Calculate padding to right-align version
@@ -1985,7 +2210,32 @@ func (m Model) View() string {
 		m.viewport.Height = 1
 	}
 
-	mainContent := fmt.Sprintf("%s\n%s\n%s%s", header, m.viewport.View(), help, errorMsg)
+	// Side content for notes
+	var sideContent string
+	sidebarWidth := 35
+	if m.mode == modeNoteSidebar || m.mode == modeWordSelect || m.mode == modeNoteInput || m.mode == modeReferenceList {
+		sideContent = m.renderNoteSidebar()
+	}
+
+	var viewportView string
+	if sideContent != "" {
+		m.viewport.Width = m.width - sidebarWidth - 2
+		
+		sidebar := lipgloss.NewStyle().
+			Width(sidebarWidth).
+			Height(m.viewport.Height).
+			Border(lipgloss.NormalBorder(), false, false, false, true).
+			BorderForeground(m.currentTheme.Border).
+			Padding(0, 1).
+			Render(sideContent)
+		
+		viewportView = lipgloss.JoinHorizontal(lipgloss.Top, m.viewport.View(), sidebar)
+	} else {
+		m.viewport.Width = m.width
+		viewportView = m.viewport.View()
+	}
+
+	mainContent := fmt.Sprintf("%s\n%s\n%s%s", header, viewportView, help, errorMsg)
 
 	if m.mode == modeLanguageSelect {
 		return m.renderLanguageSelect(header, help, errorMsg)
@@ -2819,11 +3069,168 @@ func (m Model) renderNoteInput(header, help, errorMsg string) string {
 
 	var content strings.Builder
 	content.WriteString(titleStyle.Render("Add Note for word:") + " " + currentWord + "\n\n")
+	
 	content.WriteString(m.noteInput.View())
 	content.WriteString("\n\nPress Enter to save, Esc to cancel")
 
 	listContent := containerStyle.Width(m.width - 4).Render(content.String())
 	return fmt.Sprintf("%s\n%s\n%s%s", header, listContent, help, errorMsg)
+}
+
+func (m Model) getChapterNotes() []settings.Note {
+	var chapterNotes []settings.Note
+	versePKs := make(map[int]int) // PK -> Verse Number
+	for _, v := range m.currentVerses {
+		versePKs[v.PK] = v.Verse
+	}
+
+	for _, note := range m.notes {
+		if note.Translation == m.selectedTranslation {
+			if _, ok := versePKs[note.VersePK]; ok {
+				chapterNotes = append(chapterNotes, note)
+			}
+		}
+	}
+
+	// Sort by verse number then word index
+	sort.Slice(chapterNotes, func(i, j int) bool {
+		v1 := versePKs[chapterNotes[i].VersePK]
+		v2 := versePKs[chapterNotes[j].VersePK]
+		if v1 != v2 {
+			return v1 < v2
+		}
+		return chapterNotes[i].WordIndex < chapterNotes[j].WordIndex
+	})
+
+	return chapterNotes
+}
+
+func (m Model) renderReferenceList(header, help, errorMsg string) string {
+	chapterNotes := m.getChapterNotes()
+	if len(chapterNotes) == 0 || m.noteSidebarSelected >= len(chapterNotes) {
+		return m.renderNoteSidebar() // Fallback
+	}
+
+	note := chapterNotes[m.noteSidebarSelected]
+	
+	sidebarWidth := 35
+	contentWidth := sidebarWidth - 4
+	if contentWidth < 10 {
+		contentWidth = 10
+	}
+
+	titleStyle := lipgloss.NewStyle().
+		Foreground(m.currentTheme.Accent).
+		Bold(true).
+		MarginBottom(1)
+
+	selectedStyle := lipgloss.NewStyle().
+		Foreground(m.currentTheme.Accent).
+		Background(m.currentTheme.Highlight).
+		Bold(true).
+		Padding(0, 1).
+		Width(contentWidth)
+
+	normalStyle := lipgloss.NewStyle().
+		Foreground(m.currentTheme.Primary).
+		Padding(0, 1).
+		Width(contentWidth)
+
+	var sb strings.Builder
+	sb.WriteString(titleStyle.Render("SELECT REFERENCE") + "\n\n")
+
+	for i, ref := range note.References {
+		prefix := "  "
+		style := normalStyle
+		if i == m.referenceListSelected {
+			prefix = "> "
+			style = selectedStyle
+		}
+
+		refStr := fmt.Sprintf("%s %d:%d", ref.BookName, ref.Chapter, ref.Verse)
+		sb.WriteString(style.Render(prefix+refStr) + "\n")
+	}
+
+	sb.WriteString("\n\n" + lipgloss.NewStyle().Foreground(m.currentTheme.Muted).Render("j/k: nav | enter: go\nesc: back"))
+	return sb.String()
+}
+
+func (m Model) highlightReferencesInText(text string, baseStyle lipgloss.Style) string {
+	// Robust regex for (Book Chapter:Verse) or (Chapter:Verse)
+	// Matches patterns like (John 3:16), (1 John 1:9), (Song of Solomon 1:1), (3:16), (Gen. 1:1)
+	re := regexp.MustCompile(`\((?:(?:[1-3]\s+)?[a-zA-Z\.]+(?:\s+[a-zA-Z\.]+)*\s+)?\d+:\d+\)`)
+	
+	refStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#32CD32")).Italic(true)
+	
+	matches := re.FindAllStringIndex(text, -1)
+	if matches == nil {
+		return baseStyle.Render(text)
+	}
+	var sb strings.Builder
+	lastIdx := 0
+	for _, match := range matches {
+		if match[0] > lastIdx {
+			sb.WriteString(baseStyle.Render(text[lastIdx:match[0]]))
+		}
+		sb.WriteString(refStyle.Render(text[match[0]:match[1]]))
+		lastIdx = match[1]
+	}
+	if lastIdx < len(text) {
+		sb.WriteString(baseStyle.Render(text[lastIdx:]))
+	}
+	return sb.String()
+}
+
+func (m Model) renderNoteSidebar() string {
+	chapterNotes := m.getChapterNotes()
+	if len(chapterNotes) == 0 && m.mode != modeWordSelect && m.mode != modeNoteInput {
+		return ""
+	}
+	sidebarWidth := 35
+	contentWidth := sidebarWidth - 4
+	if contentWidth < 10 { contentWidth = 10 }
+	titleStyle := lipgloss.NewStyle().Foreground(m.currentTheme.Accent).Bold(true).MarginBottom(1)
+	selectedStyle := lipgloss.NewStyle().UnsetForeground().Background(m.currentTheme.Highlight).Bold(true).Padding(0, 1).Width(contentWidth)
+	normalStyle := lipgloss.NewStyle().UnsetForeground().Padding(0, 1).Width(contentWidth)
+	verseRefStyle := lipgloss.NewStyle().Foreground(m.currentTheme.Accent).Bold(true)
+	noteTextStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF"))
+	refCountStyle := lipgloss.NewStyle().Foreground(m.currentTheme.Warning).Italic(true)
+	var sb strings.Builder
+	if m.mode == modeReferenceList {
+		return m.renderReferenceList("", "", "")
+	}
+	sb.WriteString(titleStyle.Render("CHAPTER NOTES") + "\n\n")
+	if len(chapterNotes) == 0 {
+		sb.WriteString(lipgloss.NewStyle().Foreground(m.currentTheme.Primary).Padding(0, 1).Render("No notes in this chapter."))
+		if m.mode == modeNoteSidebar {
+			sb.WriteString("\n\n" + lipgloss.NewStyle().Foreground(m.currentTheme.Success).Padding(0, 1).Render("Press 'a' to add a note"))
+		}
+	} else {
+		for i, note := range chapterNotes {
+			verseNum := 0
+			for _, v := range m.currentVerses {
+				if v.PK == note.VersePK { verseNum = v.Verse; break }
+			}
+			prefix := "  "
+			style := normalStyle
+			if (m.mode == modeNoteSidebar || m.mode == modeReferenceList) && i == m.noteSidebarSelected {
+				prefix = "> "; style = selectedStyle
+			}
+			refPrefix := fmt.Sprintf("%d:%d | ", m.currentChapter, verseNum)
+			noteText := note.Text
+			if len(noteText) > 150 { noteText = noteText[:147] + "..." }
+			innerContent := lipgloss.NewStyle().Bold(style.GetBold()).Render(prefix) + verseRefStyle.Render(refPrefix) + m.highlightReferencesInText(noteText, noteTextStyle)
+			sb.WriteString(style.Render(innerContent) + "\n")
+			if len(note.References) > 0 {
+				refStr := fmt.Sprintf("    Refs: %d", len(note.References))
+				sb.WriteString(refCountStyle.Render(refStr) + "\n")
+			}
+		}
+	}
+	if m.mode == modeNoteSidebar {
+		sb.WriteString("\n\n" + lipgloss.NewStyle().Foreground(m.currentTheme.Muted).Render("j/k: nav | enter: edit\ng: go to ref\na: add | d: delete\nesc: back"))
+	}
+	return sb.String()
 }
 
 func (m Model) renderLanguageSelect(header, help, errorMsg string) string {
