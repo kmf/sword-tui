@@ -20,3 +20,10 @@ go.work
 
 # Build number tracking
 .build_number
+
+# Editor settings
+.vscode/
+
+# Review and testing docs
+review.txt
+test.txt
