@@ -38,6 +38,14 @@ A terminal-based Bible application built with Go, bubbletea, and lipgloss.
 
 ## Installation
 
+### Homebrew (macOS and Linux)
+
+```bash
+# Install from the tap
+brew tap kmf/sword-tui
+brew install sword-tui
+```
+
 ### From Source
 
 ```bash

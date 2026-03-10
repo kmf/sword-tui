@@ -1,15 +1,26 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"os"
 	"sword-tui/internal/cache"
 	"sword-tui/internal/ui"
+	"sword-tui/internal/version"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
 
 func main() {
+	// Parse command line flags
+	versionFlag := flag.Bool("version", false, "Print version information")
+	flag.Parse()
+
+	// Handle version flag
+	if *versionFlag {
+		fmt.Printf("sword-tui %s (build %s)\n", version.Version, version.BuildNumber)
+		os.Exit(0)
+	}
 	// Initialize cache
 	cacheManager, err := cache.NewCache()
 	if err != nil {
