@@ -12,10 +12,17 @@ import (
 	"sword-tui/internal/version"
 
 	"github.com/atotto/clipboard"
+	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+)
+
+var (
+	ansiRegex    = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
+	htmlTagRegex = regexp.MustCompile(`<[^>]*>`)
+	refRegex     = regexp.MustCompile(`\((?:(?:[1-3]\s+)?[a-zA-Z\.]+(?:\s+[a-zA-Z\.]+)*\s+)?\d+:\d+\)`)
 )
 
 type viewMode int
@@ -30,12 +37,22 @@ const (
 	modeThemeSelect
 	modeAbout
 	modeWordSearch
+	modeLanguageSelect
+	modeHighlightSettings
+	modeVerseHighlight
+	modeWordSelect
+	modeNoteInput
+	modeNoteSidebar
+	modeReferenceSelect
+	modeReferenceList
 )
 
 type Model struct {
 	client                 *api.Client
 	viewport               viewport.Model
 	textInput              textinput.Model
+	languages              []string
+	selectedLanguage       string
 	translations           []api.Translation
 	selectedTranslation    string
 	currentBook            int
@@ -72,11 +89,33 @@ type Model struct {
 	cachedTranslations     []string
 	cacheSelected          int
 	downloadingTranslation string
-	// Translation selection state
+	// Selection state
+	languageSelected    int
 	translationSelected int
 	// Theme state
 	currentTheme  theme.Theme
 	themeSelected int
+	// Highlight state
+	highlights             []settings.Highlight
+	selectedHighlightColor string
+	highlightColorSelected int
+	verseCursorPos         int // character index within current verse
+	selectionStart         int // -1 if no selection active
+	hKeyPending            bool
+	// Note state
+	notes               []settings.Note
+	selectedSymbolStyle string
+	wordIndex           int // index of selected word in verse
+	noteInput           textarea.Model
+	showNoteSidebar     bool
+	noteSidebarSelected int
+	referenceListSelected int
+	tempReferences      []settings.Reference
+	originalBook        int
+	originalChapter     int
+	editingNoteVersePK  int
+	editingNoteWordIndex int
+	nKeyPending         bool
 	// Word search state
 	wordSearchInput    textinput.Model
 	wordSearchQuery    string
@@ -99,11 +138,13 @@ type CacheInterface interface {
 
 type (
 	errMsg                  struct{ err error }
+	languagesLoadedMsg      struct{ languages []string }
 	translationsLoadedMsg   struct{ translations []api.Translation }
 	booksLoadedMsg          struct{ books []api.Book }
 	chapterLoadedMsg        struct{ verses []api.Verse }
 	parallelVersesLoadedMsg struct{ verses map[string][]api.Verse }
 	cacheListLoadedMsg      struct{ translations []string }
+	downloadingTranslation string
 	downloadCompleteMsg     struct{ translation string }
 	downloadErrorMsg        struct {
 		translation string
@@ -136,15 +177,29 @@ func NewModel() Model {
 	wordSearch.CharLimit = 100
 	wordSearch.Width = 50
 
+	noteInput := textarea.New()
+	noteInput.Placeholder = "Enter note..."
+	noteInput.CharLimit = 500
+	noteInput.SetWidth(30)
+	noteInput.SetHeight(5)
+
 	// --- Load persisted settings (if any) ---
 	cfg, err := settings.Load()
 
+	selectedLanguage := "English"
 	selectedTranslation := "NLT"
 	currentBook := 1
 	currentChapter := 1
 	currentTheme := theme.CatppuccinMocha
+	var highlights []settings.Highlight
+	selectedHighlightColor := "#FFFF00" // Default yellow
+	var notes []settings.Note
+	selectedSymbolStyle := "numbers"
 
 	if err == nil {
+		if cfg.SelectedLanguage != "" {
+			selectedLanguage = cfg.SelectedLanguage
+		}
 		if cfg.SelectedTranslation != "" {
 			selectedTranslation = cfg.SelectedTranslation
 		}
@@ -153,6 +208,18 @@ func NewModel() Model {
 		}
 		if cfg.CurrentChapter > 0 {
 			currentChapter = cfg.CurrentChapter
+		}
+		if cfg.Highlights != nil {
+			highlights = cfg.Highlights
+		}
+		if cfg.SelectedHighlightColor != "" {
+			selectedHighlightColor = cfg.SelectedHighlightColor
+		}
+		if cfg.Notes != nil {
+			notes = cfg.Notes
+		}
+		if cfg.SelectedSymbolStyle != "" {
+			selectedSymbolStyle = cfg.SelectedSymbolStyle
 		}
 		if cfg.CurrentTheme != "" {
 			// Match by display name against all known themes
@@ -170,6 +237,8 @@ func NewModel() Model {
 		textInput:              ti,
 		millerFilterInput:      millerFilter,
 		wordSearchInput:        wordSearch,
+		noteInput:              noteInput,
+		selectedLanguage:       selectedLanguage,
 		selectedTranslation:    selectedTranslation,
 		currentBook:            currentBook,
 		currentChapter:         currentChapter,
@@ -178,6 +247,11 @@ func NewModel() Model {
 		comparisonTranslations: []string{"NLT", "KJV", "WEB"},
 		currentTheme:           currentTheme,
 		themeSelected:          0,
+		highlights:             highlights,
+		selectedHighlightColor: selectedHighlightColor,
+		selectionStart:         -1,
+		notes:                  notes,
+		selectedSymbolStyle:    selectedSymbolStyle,
 	}
 }
 
@@ -191,15 +265,31 @@ func (m *Model) SetCache(cache CacheInterface) {
 
 func (m Model) Init() tea.Cmd {
 	return tea.Batch(
-		loadTranslations(m.client),
+		loadLanguages(m.client),
+		loadTranslations(m.client, m.selectedLanguage),
 		loadBooks(m.client, m.selectedTranslation),
 		loadChapter(m.client, m.selectedTranslation, m.currentBook, m.currentChapter),
 	)
 }
 
-func loadTranslations(client *api.Client) tea.Cmd {
+func loadLanguages(client *api.Client) tea.Cmd {
 	return func() tea.Msg {
-		translations, err := client.GetTranslations()
+		groups, err := client.GetLanguageGroups()
+		if err != nil {
+			return errMsg{err}
+		}
+		var langs []string
+		for _, g := range groups {
+			langs = append(langs, g.Language)
+		}
+		sort.Strings(langs)
+		return languagesLoadedMsg{langs}
+	}
+}
+
+func loadTranslations(client *api.Client, language string) tea.Cmd {
+	return func() tea.Msg {
+		translations, err := client.GetTranslations(language)
 		if err != nil {
 			return errMsg{err}
 		}
@@ -277,6 +367,42 @@ func loadSearchResults(client *api.Client, translation, query string) tea.Cmd {
 	}
 }
 
+func (m Model) getContentWidth() int {
+	w := m.width
+	if m.showSidebar {
+		// sidebar width for books (usually 25 chars + border)
+		w -= 27
+	}
+	if m.mode == modeNoteSidebar || m.mode == modeWordSelect || m.mode == modeNoteInput || m.mode == modeReferenceList {
+		// sidebar width for notes (usually 35 chars + border/padding)
+		w -= 37
+	}
+	if w < 10 {
+		w = 10
+	}
+	return w
+}
+
+func (m Model) assembleView(header, body, help, errorMsg string) string {
+	// Assemble the final view using JoinVertical for robustness
+	// This ensures we always return exactly the right number of lines
+	
+	var view string
+	if errorMsg != "" {
+		view = lipgloss.JoinVertical(lipgloss.Left, header, body, help, errorMsg)
+	} else {
+		view = lipgloss.JoinVertical(lipgloss.Left, header, body, help)
+	}
+	
+	// Force the view to cover the full height of the terminal to prevent stale text
+	return lipgloss.NewStyle().
+		Width(m.width).
+		Height(m.height).
+		MaxHeight(m.height).
+		MaxWidth(m.width).
+		Render(view)
+}
+
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	var cmds []tea.Cmd
@@ -284,13 +410,161 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch msg.String() {
+		case "H": // Shift+h
+			if m.mode == modeVerseHighlight {
+				if m.selectionStart == -1 {
+					m.selectionStart = m.verseCursorPos
+				}
+				if m.verseCursorPos > 0 {
+					m.verseCursorPos--
+					m.content = m.formatChapter(m.currentVerses, m.currentBookName, m.currentChapter, m.width, m.highlightedVerseStart, m.highlightedVerseEnd)
+					m.viewport.SetContent(m.content)
+				}
+				return m, nil
+			}
+		case "L": // Shift+l
+			if m.mode == modeVerseHighlight {
+				if m.selectionStart == -1 {
+					m.selectionStart = m.verseCursorPos
+				}
+				var currentText string
+				for _, v := range m.currentVerses {
+					if v.Verse == m.highlightedVerseStart {
+						currentText = stripHTMLTags(v.Text)
+						break
+					}
+				}
+				if m.verseCursorPos < len(currentText)-1 {
+					m.verseCursorPos++
+					m.content = m.formatChapter(m.currentVerses, m.currentBookName, m.currentChapter, m.width, m.highlightedVerseStart, m.highlightedVerseEnd)
+					m.viewport.SetContent(m.content)
+				}
+				return m, nil
+			}
+		case "ctrl+r":
+			if m.mode == modeNoteInput {
+				m.originalBook = m.currentBook
+				m.originalChapter = m.currentChapter
+				m.mode = modeReferenceSelect
+				m.showMillerColumns = true
+				m.millerColumn = 0
+				return m, nil
+			}
+		case "ctrl+enter", "ctrl+l", "ctrl+j", "ctrl+m", "g":
+			if m.mode == modeNoteSidebar {
+				notes := m.getChapterNotes()
+				if len(notes) > 0 && m.noteSidebarSelected < len(notes) {
+					note := notes[m.noteSidebarSelected]
+					if len(note.References) == 1 {
+						// Single reference, go directly
+						ref := note.References[0]
+						m.originalBook = m.currentBook
+						m.originalChapter = m.currentChapter
+						m.currentBook = ref.BookID
+						m.currentBookName = ref.BookName
+						m.currentChapter = ref.Chapter
+						m.highlightedVerseStart = ref.Verse
+						m.highlightedVerseEnd = ref.Verse
+						m.mode = modeReader
+						m.loading = true
+						return m, loadChapter(m.client, m.selectedTranslation, m.currentBook, m.currentChapter)
+					} else if len(note.References) > 1 {
+						// Multiple references, show selection list
+						m.originalBook = m.currentBook
+						m.originalChapter = m.currentChapter
+						m.mode = modeReferenceList
+						m.referenceListSelected = 0
+						return m, nil
+					}
+				}
+			}
+		case "a":
+			if m.mode == modeNoteSidebar {
+				if m.highlightedVerseStart == 0 {
+					// Ensure a verse is selected before adding a note
+					if len(m.currentVerses) > 0 {
+						m.highlightedVerseStart = m.currentVerses[0].Verse
+						m.highlightedVerseEnd = m.currentVerses[0].Verse
+					} else {
+						return m, nil
+					}
+				}
+				m.mode = modeWordSelect
+				m.wordIndex = 0
+				return m, nil
+			}
+		case "d":
+			if m.mode == modeVerseHighlight {
+				var versePK int
+				found := false
+				for _, v := range m.currentVerses {
+					if v.Verse == m.highlightedVerseStart {
+						versePK = v.PK
+						found = true
+						break
+					}
+				}
+
+				if !found {
+					return m, nil
+				}
+
+				pos := m.verseCursorPos
+				newHighlights := []settings.Highlight{}
+				changed := false
+				for _, h := range m.highlights {
+					// Check if cursor is within this highlight's range
+					if h.VersePK == versePK && pos >= h.Start && pos < h.End {
+						changed = true
+						continue
+					}
+					newHighlights = append(newHighlights, h)
+				}
+				
+				if changed {
+					m.highlights = newHighlights
+					m.content = m.formatChapter(m.currentVerses, m.currentBookName, m.currentChapter, m.getContentWidth(), m.highlightedVerseStart, m.highlightedVerseEnd)
+					m.viewport.SetContent(m.content)
+				}
+				return m, nil
+			}
+			if m.mode == modeNoteSidebar {
+				notes := m.getChapterNotes()
+				if len(notes) > 0 && m.noteSidebarSelected < len(notes) {
+					noteToDelete := notes[m.noteSidebarSelected]
+					// Remove from m.notes
+					for i, n := range m.notes {
+						if n.VersePK == noteToDelete.VersePK && n.WordIndex == noteToDelete.WordIndex && n.Translation == noteToDelete.Translation {
+							m.notes = append(m.notes[:i], m.notes[i+1:]...)
+							break
+						}
+					}
+					if m.noteSidebarSelected > 0 && m.noteSidebarSelected >= len(m.getChapterNotes()) {
+						m.noteSidebarSelected--
+					}
+				}
+				return m, nil
+			}
+			if m.mode == modeReader && !m.showSidebar {
+				m.mode = modeCacheManager
+				m.cacheSelected = 0
+				if m.cache != nil {
+					return m, loadCachedList(m.cache)
+				}
+				return m, nil
+			}
 		case "ctrl+c", "q":
 			// Save settings synchronously before quitting to avoid race condition
 			cfg := settings.Settings{
-				SelectedTranslation: m.selectedTranslation,
-				CurrentBook:         m.currentBook,
-				CurrentChapter:      m.currentChapter,
-				CurrentTheme:        m.currentTheme.Name,
+				SelectedLanguage:       m.selectedLanguage,
+				SelectedTranslation:    m.selectedTranslation,
+				CurrentBook:            m.currentBook,
+				CurrentChapter:         m.currentChapter,
+				CurrentTheme:           m.currentTheme.Name,
+				Highlights:             m.highlights,
+				SelectedHighlightColor: m.selectedHighlightColor,
+				Notes:                  m.notes,
+				SelectedSymbolStyle:    m.selectedSymbolStyle,
 			}
 			_ = settings.Save(cfg)
 			return m, tea.Quit
@@ -348,8 +622,80 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.textInput.Focus()
 				return m, nil
 			}
+		case "J": // Shift+j (extend highlight forward)
+			if m.mode == modeVerseHighlight {
+				if m.selectionStart == -1 {
+					m.selectionStart = m.verseCursorPos
+				}
+				var currentText string
+				for _, v := range m.currentVerses {
+					if v.Verse == m.highlightedVerseStart {
+						currentText = stripHTMLTags(v.Text)
+						break
+					}
+				}
+				// Jump 5 chars forward
+				m.verseCursorPos += 5
+				if m.verseCursorPos >= len(currentText) {
+					m.verseCursorPos = len(currentText) - 1
+				}
+				if m.verseCursorPos < 0 {
+					m.verseCursorPos = 0
+				}
+				m.content = m.formatChapter(m.currentVerses, m.currentBookName, m.currentChapter, m.width, m.highlightedVerseStart, m.highlightedVerseEnd)
+				m.viewport.SetContent(m.content)
+				return m, nil
+			}
+		case "K": // Shift+k (extend highlight backward)
+			if m.mode == modeVerseHighlight {
+				if m.selectionStart == -1 {
+					m.selectionStart = m.verseCursorPos
+				}
+				m.verseCursorPos -= 5
+				if m.verseCursorPos < 0 {
+					m.verseCursorPos = 0
+				}
+				m.content = m.formatChapter(m.currentVerses, m.currentBookName, m.currentChapter, m.width, m.highlightedVerseStart, m.highlightedVerseEnd)
+				m.viewport.SetContent(m.content)
+				return m, nil
+			}
 		case "up", "k":
-			if m.mode == modeWordSearch && m.wordSearchResults != nil && m.wordSearchSelected > 0 {
+			if m.mode == modeNoteSidebar {
+				if m.noteSidebarSelected > 0 {
+					m.noteSidebarSelected--
+				}
+				return m, nil
+			}
+			if m.mode == modeReferenceList {
+				if m.referenceListSelected > 0 {
+					m.referenceListSelected--
+				}
+				return m, nil
+			}
+			if m.mode == modeVerseHighlight {
+				m.verseCursorPos -= 10 // Page-like jump in verse
+				if m.verseCursorPos < 0 { m.verseCursorPos = 0 }
+				m.content = m.formatChapter(m.currentVerses, m.currentBookName, m.currentChapter, m.width, m.highlightedVerseStart, m.highlightedVerseEnd)
+				m.viewport.SetContent(m.content)
+				return m, nil
+			}
+			if m.mode == modeWordSelect {
+				if m.wordIndex > 0 {
+					m.wordIndex--
+					m.content = m.formatChapter(m.currentVerses, m.currentBookName, m.currentChapter, m.width, m.highlightedVerseStart, m.highlightedVerseEnd)
+					m.viewport.SetContent(m.content)
+				}
+				return m, nil
+			}
+			m.hKeyPending = false
+			m.nKeyPending = false
+			if m.mode == modeHighlightSettings && m.highlightColorSelected > 0 {
+				m.highlightColorSelected--
+				return m, nil
+			} else if m.mode == modeLanguageSelect && m.languages != nil && m.languageSelected > 0 {
+				m.languageSelected--
+				return m, nil
+			} else if m.mode == modeWordSearch && m.wordSearchResults != nil && m.wordSearchSelected > 0 {
 				m.wordSearchSelected--
 				return m, nil
 			} else if m.mode == modeTranslationSelect && m.translations != nil && m.translationSelected > 0 {
@@ -368,11 +714,29 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.millerBookIdx--
 						m.millerChapterIdx = 0
 						m.millerVerseIdx = 0
+						// Reload verses for newly selected book/chapter
+						booksToUse := m.books
+						if m.millerFilter != "" && m.millerFilteredBooks != nil {
+							booksToUse = m.millerFilteredBooks
+						}
+						if m.millerBookIdx < len(booksToUse) {
+							selectedBook := booksToUse[m.millerBookIdx]
+							return m, loadChapter(m.client, m.selectedTranslation, selectedBook.BookID, 1)
+						}
 					}
 				case 1: // Chapters column
 					if m.millerChapterIdx > 0 {
 						m.millerChapterIdx--
 						m.millerVerseIdx = 0
+						// Reload verses for newly selected chapter
+						booksToUse := m.books
+						if m.millerFilter != "" && m.millerFilteredBooks != nil {
+							booksToUse = m.millerFilteredBooks
+						}
+						if m.millerBookIdx < len(booksToUse) {
+							selectedBook := booksToUse[m.millerBookIdx]
+							return m, loadChapter(m.client, m.selectedTranslation, selectedBook.BookID, m.millerChapterIdx+1)
+						}
 					}
 				case 2: // Verses column
 					if m.millerVerseIdx > 0 {
@@ -402,7 +766,67 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case "down", "j":
-			if m.mode == modeWordSearch && m.wordSearchResults != nil && m.wordSearchSelected < len(m.wordSearchResults)-1 {
+			if m.mode == modeNoteSidebar {
+				notes := m.getChapterNotes()
+				if m.noteSidebarSelected < len(notes)-1 {
+					m.noteSidebarSelected++
+				}
+				return m, nil
+			}
+			if m.mode == modeReferenceList {
+				notes := m.getChapterNotes()
+				if m.noteSidebarSelected < len(notes) {
+					note := notes[m.noteSidebarSelected]
+					if m.referenceListSelected < len(note.References)-1 {
+						m.referenceListSelected++
+					}
+				}
+				return m, nil
+			}
+			if m.mode == modeVerseHighlight {
+				var currentText string
+				for _, v := range m.currentVerses {
+					if v.Verse == m.highlightedVerseStart {
+						currentText = stripHTMLTags(v.Text)
+						break
+					}
+				}
+				m.verseCursorPos += 10
+				if m.verseCursorPos >= len(currentText) {
+					m.verseCursorPos = len(currentText) - 1
+				}
+				if m.verseCursorPos < 0 {
+					m.verseCursorPos = 0
+				}
+				m.content = m.formatChapter(m.currentVerses, m.currentBookName, m.currentChapter, m.width, m.highlightedVerseStart, m.highlightedVerseEnd)
+				m.viewport.SetContent(m.content)
+				return m, nil
+			}
+			if m.mode == modeWordSelect {
+				var currentText string
+				for _, v := range m.currentVerses {
+					if v.Verse == m.highlightedVerseStart {
+						currentText = stripHTMLTags(v.Text)
+						break
+					}
+				}
+				words := strings.Split(currentText, " ")
+				if m.wordIndex < len(words)-1 {
+					m.wordIndex++
+					m.content = m.formatChapter(m.currentVerses, m.currentBookName, m.currentChapter, m.width, m.highlightedVerseStart, m.highlightedVerseEnd)
+					m.viewport.SetContent(m.content)
+				}
+				return m, nil
+			}
+			m.hKeyPending = false
+			m.nKeyPending = false
+			if m.mode == modeHighlightSettings && m.highlightColorSelected < 7 { // 8 basic colors
+				m.highlightColorSelected++
+				return m, nil
+			} else if m.mode == modeLanguageSelect && m.languages != nil && m.languageSelected < len(m.languages)-1 {
+				m.languageSelected++
+				return m, nil
+			} else if m.mode == modeWordSearch && m.wordSearchResults != nil && m.wordSearchSelected < len(m.wordSearchResults)-1 {
 				m.wordSearchSelected++
 				return m, nil
 			} else if m.mode == modeTranslationSelect && m.translations != nil && m.translationSelected < len(m.translations)-1 {
@@ -425,6 +849,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.millerBookIdx++
 						m.millerChapterIdx = 0
 						m.millerVerseIdx = 0
+						// Reload verses for newly selected book/chapter
+						selectedBook := booksToUse[m.millerBookIdx]
+						return m, loadChapter(m.client, m.selectedTranslation, selectedBook.BookID, 1)
 					}
 				case 1: // Chapters column
 					booksToUse := m.books
@@ -436,6 +863,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						if m.millerChapterIdx < selectedBook.Chapters-1 {
 							m.millerChapterIdx++
 							m.millerVerseIdx = 0
+							// Reload verses for newly selected chapter
+							return m, loadChapter(m.client, m.selectedTranslation, selectedBook.BookID, m.millerChapterIdx+1)
 						}
 					}
 				case 2: // Verses column
@@ -470,11 +899,70 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case "left", "h":
+			if m.mode == modeVerseHighlight {
+				if m.verseCursorPos > 0 {
+					m.verseCursorPos--
+					// Refresh content to show cursor move
+					m.content = m.formatChapter(m.currentVerses, m.currentBookName, m.currentChapter, m.width, m.highlightedVerseStart, m.highlightedVerseEnd)
+					m.viewport.SetContent(m.content)
+				}
+				return m, nil
+			}
+			if m.mode == modeWordSelect {
+				if m.wordIndex > 0 {
+					m.wordIndex--
+					m.content = m.formatChapter(m.currentVerses, m.currentBookName, m.currentChapter, m.width, m.highlightedVerseStart, m.highlightedVerseEnd)
+					m.viewport.SetContent(m.content)
+				}
+				return m, nil
+			}
+			if m.mode == modeReader && !m.showSidebar && !m.showMillerColumns {
+				m.mode = modeVerseHighlight
+				m.verseCursorPos = 0
+				m.selectionStart = -1
+				return m, nil
+			}
+			m.hKeyPending = false
+			m.nKeyPending = false
 			if m.showMillerColumns && !m.millerFilterMode && m.millerColumn > 0 {
 				m.millerColumn--
 				return m, nil
 			}
 		case "right", "l":
+			if m.mode == modeVerseHighlight {
+				var currentText string
+				for _, v := range m.currentVerses {
+					if v.Verse == m.highlightedVerseStart {
+						currentText = stripHTMLTags(v.Text)
+						break
+					}
+				}
+				if m.verseCursorPos < len(currentText)-1 {
+					m.verseCursorPos++
+					// Refresh content to show cursor move
+					m.content = m.formatChapter(m.currentVerses, m.currentBookName, m.currentChapter, m.width, m.highlightedVerseStart, m.highlightedVerseEnd)
+					m.viewport.SetContent(m.content)
+				}
+				return m, nil
+			}
+			if m.mode == modeWordSelect {
+				var currentText string
+				for _, v := range m.currentVerses {
+					if v.Verse == m.highlightedVerseStart {
+						currentText = stripHTMLTags(v.Text)
+						break
+					}
+				}
+				words := strings.Split(currentText, " ")
+				if m.wordIndex < len(words)-1 {
+					m.wordIndex++
+					m.content = m.formatChapter(m.currentVerses, m.currentBookName, m.currentChapter, m.width, m.highlightedVerseStart, m.highlightedVerseEnd)
+					m.viewport.SetContent(m.content)
+				}
+				return m, nil
+			}
+			m.hKeyPending = false
+			m.nKeyPending = false
 			if m.showMillerColumns && !m.millerFilterMode {
 				if m.millerColumn < 2 {
 					m.millerColumn++
@@ -495,6 +983,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				}
 				return m, nil
+			} else if m.mode == modeReader && !m.showSidebar {
+				m.mode = modeLanguageSelect
+				m.languageSelected = 0
+				if m.languages != nil {
+					for i, lang := range m.languages {
+						if lang == m.selectedLanguage {
+							m.languageSelected = i
+							break
+						}
+					}
+				}
+				return m, nil
 			}
 		case "c":
 			if m.mode == modeReader && !m.showSidebar {
@@ -506,13 +1006,54 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, loadParallelVerses(m.client, m.comparisonTranslations, m.currentBook, m.currentChapter, verses)
 			}
 		case "r":
-			// Don't intercept 'r' when typing in search inputs
+			if m.mode == modeVerseHighlight && m.selectionStart != -1 {
+				var versePK int
+				for _, v := range m.currentVerses {
+					if v.Verse == m.highlightedVerseStart {
+						versePK = v.PK
+						break
+					}
+				}
+
+				start, end := m.selectionStart, m.verseCursorPos
+				if start > end {
+					start, end = end, start
+				}
+				end++ // make inclusive for comparison
+
+				// Remove any highlights that overlap or match this range
+				newHighlights := []settings.Highlight{}
+				for _, h := range m.highlights {
+					if h.VersePK == versePK && h.Start == start && h.End == end {
+						// Match found - skip this one to remove it
+						continue
+					}
+					newHighlights = append(newHighlights, h)
+				}
+				m.highlights = newHighlights
+				m.selectionStart = -1
+				// Re-render
+				m.content = m.formatChapter(m.currentVerses, m.currentBookName, m.currentChapter, m.width, m.highlightedVerseStart, m.highlightedVerseEnd)
+				m.viewport.SetContent(m.content)
+				return m, nil
+			}
+			// Don't intercept 'r' when typing in search inputs or notes
 			if m.mode == modeSearch {
 				// Let it pass through to verse reference input
+			} else if m.mode == modeNoteInput {
+				// Let it pass through to note input
 			} else if m.mode == modeWordSearch && m.wordSearchResults == nil && !m.wordSearchLoading {
 				// Let it pass through to word search input
 			} else if m.mode != modeReader {
+				// Cleanup transient state
+				m.wordSearchResults = nil
+				m.wordSearchInput.SetValue("")
+				m.showMillerColumns = false
+				m.showSidebar = false
 				m.mode = modeReader
+				// Re-format for full width
+				m.content = m.formatChapter(m.currentVerses, m.currentBookName, m.currentChapter, m.getContentWidth(), m.highlightedVerseStart, m.highlightedVerseEnd)
+				m.viewport.SetContent(m.content)
 				return m, nil
 			}
 		case "t":
@@ -544,36 +1085,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 			}
-		case "d":
-			if m.mode == modeReader && !m.showSidebar {
-				m.mode = modeCacheManager
-				m.cacheSelected = 0
-				if m.cache != nil {
-					return m, loadCachedList(m.cache)
-				}
-				return m, nil
-			}
 		case "?":
 			if m.mode == modeReader && !m.showSidebar {
 				m.mode = modeAbout
 				return m, nil
 			}
-		case "s":
-			if m.mode == modeReader && !m.showSidebar {
-				m.mode = modeWordSearch
-				m.wordSearchInput.SetValue("")
-				m.wordSearchInput.Focus()
-				m.wordSearchResults = nil
-				m.wordSearchSelected = 0
-				m.wordSearchLoading = false
-				return m, nil
-			}
 		case "n":
+			// Go to next chapter (with book transition)
 			if m.mode == modeReader && m.books != nil {
-				for _, book := range m.books {
+				for i, book := range m.books {
 					if book.BookID == m.currentBook {
 						if m.currentChapter < book.Chapters {
 							m.currentChapter++
+							m.loading = true
+							m.highlightedVerseStart = 0
+							m.highlightedVerseEnd = 0
+							return m, loadChapter(m.client, m.selectedTranslation, m.currentBook, m.currentChapter)
+						} else if i < len(m.books)-1 {
+							// Transition to next book
+							nextBook := m.books[i+1]
+							m.currentBook = nextBook.BookID
+							m.currentBookName = nextBook.Name
+							m.currentChapter = 1
 							m.loading = true
 							m.highlightedVerseStart = 0
 							m.highlightedVerseEnd = 0
@@ -582,13 +1115,55 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				}
 			}
+		case "N":
+			if m.mode == modeReader && !m.showSidebar && !m.showMillerColumns {
+				m.mode = modeNoteSidebar
+				m.noteSidebarSelected = 0
+				// Re-format with note sidebar width
+				m.content = m.formatChapter(m.currentVerses, m.currentBookName, m.currentChapter, m.getContentWidth(), m.highlightedVerseStart, m.highlightedVerseEnd)
+				m.viewport.SetContent(m.content)
+				return m, nil
+			}
+		case "s":
+			if m.hKeyPending {
+				m.hKeyPending = false
+				m.mode = modeHighlightSettings
+				m.highlightColorSelected = 0
+				return m, nil
+			}
+			if m.nKeyPending {
+				m.nKeyPending = false
+				// For now, toggle between numbers and symbols
+				if m.selectedSymbolStyle == "numbers" {
+					m.selectedSymbolStyle = "symbols"
+				} else {
+					m.selectedSymbolStyle = "numbers"
+				}
+				return m, nil
+			}
 		case "p":
-			if m.mode == modeReader && m.currentChapter > 1 {
-				m.currentChapter--
-				m.loading = true
-				m.highlightedVerseStart = 0
-				m.highlightedVerseEnd = 0
-				return m, loadChapter(m.client, m.selectedTranslation, m.currentBook, m.currentChapter)
+			if m.mode == modeReader {
+				if m.currentChapter > 1 {
+					m.currentChapter--
+					m.loading = true
+					m.highlightedVerseStart = 0
+					m.highlightedVerseEnd = 0
+					return m, loadChapter(m.client, m.selectedTranslation, m.currentBook, m.currentChapter)
+				} else if m.books != nil {
+					// Transition to previous book
+					for i, book := range m.books {
+						if book.BookID == m.currentBook && i > 0 {
+							prevBook := m.books[i-1]
+							m.currentBook = prevBook.BookID
+							m.currentBookName = prevBook.Name
+							m.currentChapter = prevBook.Chapters
+							m.loading = true
+							m.highlightedVerseStart = 0
+							m.highlightedVerseEnd = 0
+							return m, loadChapter(m.client, m.selectedTranslation, m.currentBook, m.currentChapter)
+						}
+					}
+				}
 			}
 		case "y":
 			// Yank (copy) highlighted verse(s) or current chapter to clipboard
@@ -647,7 +1222,178 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, loadChapter(m.client, m.selectedTranslation, m.currentBook, m.currentChapter)
 			}
 		case "enter":
-			if m.mode == modeTranslationSelect && m.translations != nil && m.translationSelected < len(m.translations) {
+			if m.mode == modeNoteSidebar {
+				notes := m.getChapterNotes()
+				if len(notes) > 0 && m.noteSidebarSelected < len(notes) {
+					note := notes[m.noteSidebarSelected]
+					m.mode = modeNoteInput
+					m.wordIndex = note.WordIndex
+					m.editingNoteVersePK = note.VersePK
+					m.editingNoteWordIndex = note.WordIndex
+					// We need to set highlightedVerseStart to match the note's verse
+					for _, v := range m.currentVerses {
+						if v.PK == note.VersePK {
+							m.highlightedVerseStart = v.Verse
+							m.highlightedVerseEnd = v.Verse
+							break
+						}
+					}
+					m.noteInput.Focus()
+					m.noteInput.SetValue(note.Text)
+					m.noteInput.SetWidth(m.width - 10)
+					m.tempReferences = append([]settings.Reference{}, note.References...)
+				}
+				return m, nil
+			}
+			if m.mode == modeReferenceList {
+				notes := m.getChapterNotes()
+				if len(notes) > 0 && m.noteSidebarSelected < len(notes) {
+					note := notes[m.noteSidebarSelected]
+					if m.referenceListSelected < len(note.References) {
+						ref := note.References[m.referenceListSelected]
+						m.currentBook = ref.BookID
+						m.currentBookName = ref.BookName
+						m.currentChapter = ref.Chapter
+						m.highlightedVerseStart = ref.Verse
+						m.highlightedVerseEnd = ref.Verse
+						m.mode = modeReader
+						m.loading = true
+						m.originalBook = 0
+						m.originalChapter = 0
+						return m, loadChapter(m.client, m.selectedTranslation, m.currentBook, m.currentChapter)
+					}
+				}
+				return m, nil
+			}
+			if m.hKeyPending {
+				m.hKeyPending = false
+				m.mode = modeVerseHighlight
+				m.verseCursorPos = 0
+				m.selectionStart = -1
+				return m, nil
+			}
+			if m.nKeyPending {
+				m.nKeyPending = false
+				m.mode = modeWordSelect
+				m.wordIndex = 0
+				return m, nil
+			}
+			if m.mode == modeWordSelect {
+				// Transition to note input for selected word
+				m.mode = modeNoteInput
+				m.noteInput.Focus()
+				m.noteInput.SetWidth(m.width - 10)
+				// Load existing note if any
+				m.noteInput.SetValue("")
+				m.tempReferences = nil
+				var versePK int
+				for _, v := range m.currentVerses {
+					if v.Verse == m.highlightedVerseStart {
+						versePK = v.PK
+						break
+					}
+				}
+				m.editingNoteVersePK = versePK
+				m.editingNoteWordIndex = m.wordIndex
+				for _, note := range m.notes {
+					if note.VersePK == versePK && note.WordIndex == m.wordIndex && note.Translation == m.selectedTranslation {
+						m.noteInput.SetValue(note.Text)
+						m.tempReferences = append([]settings.Reference{}, note.References...)
+						break
+					}
+				}
+				return m, nil
+			}
+			if m.mode == modeNoteInput {
+				// Save note using the preserved context
+				versePK := m.editingNoteVersePK
+				wordIdx := m.editingNoteWordIndex
+				
+				noteText := strings.TrimSpace(m.noteInput.Value())
+				
+				// Precise one-to-one synchronization of m.tempReferences with noteText
+				// This handles multiple identical references correctly.
+				var finalRefs []settings.Reference
+				remainingText := noteText
+				for _, ref := range m.tempReferences {
+					refStr := fmt.Sprintf("(%s %d:%d)", ref.BookName, ref.Chapter, ref.Verse)
+					if strings.Contains(remainingText, refStr) {
+						finalRefs = append(finalRefs, ref)
+						// Remove only the FIRST occurrence of this ref from remainingText 
+						// so we don't match it again for duplicate structured refs
+						remainingText = strings.Replace(remainingText, refStr, "", 1)
+					}
+				}
+				m.tempReferences = finalRefs
+
+				// Clean up any existing notes for this same word to prevent duplicates/ghost text
+				var filteredNotes []settings.Note
+				for _, note := range m.notes {
+					if note.VersePK == versePK && note.WordIndex == wordIdx && note.Translation == m.selectedTranslation {
+						continue
+					}
+					filteredNotes = append(filteredNotes, note)
+				}
+				m.notes = filteredNotes
+				
+				// Add the updated/new note if not empty
+				if noteText != "" || len(m.tempReferences) > 0 {
+					m.notes = append(m.notes, settings.Note{
+						Translation: m.selectedTranslation,
+						VersePK:     versePK,
+						WordIndex:   wordIdx,
+						Symbol:      "*",
+						Text:        noteText,
+						References:  m.tempReferences,
+					})
+				}
+				
+				m.mode = modeNoteSidebar
+				m.noteSidebarSelected = 0
+				return m, nil
+			}
+			if m.mode == modeVerseHighlight {
+				// Save highlight if selection exists
+				if m.selectionStart != -1 {
+					var versePK int
+					for _, v := range m.currentVerses {
+						if v.Verse == m.highlightedVerseStart {
+							versePK = v.PK
+							break
+						}
+					}
+
+					start := m.selectionStart
+					end := m.verseCursorPos
+					if start > end {
+						start, end = end, start
+					}
+					// end is exclusive in slices usually, but here we'll include it
+					m.highlights = append(m.highlights, settings.Highlight{
+						VersePK: versePK,
+						Start:   start,
+						End:     end + 1,
+						Color:   m.selectedHighlightColor,
+					})
+					m.selectionStart = -1
+					// Re-render
+					m.content = m.formatChapter(m.currentVerses, m.currentBookName, m.currentChapter, m.width, m.highlightedVerseStart, m.highlightedVerseEnd)
+					m.viewport.SetContent(m.content)
+				}
+				return m, nil
+			}
+			if m.mode == modeHighlightSettings {
+				colors := []string{"#FFFF00", "#FF00FF", "#00FFFF", "#00FF00", "#FF0000", "#0000FF", "#FFFFFF", "#FFA500"}
+				m.selectedHighlightColor = colors[m.highlightColorSelected]
+				m.mode = modeReader
+				return m, nil
+			}
+			if m.mode == modeLanguageSelect && m.languages != nil && m.languageSelected < len(m.languages) {
+				m.selectedLanguage = m.languages[m.languageSelected]
+				m.mode = modeTranslationSelect
+				m.translationSelected = 0
+				return m, loadTranslations(m.client, m.selectedLanguage)
+			} else if m.mode == modeTranslationSelect && m.translations != nil && m.translationSelected < len(m.translations) {
 				// Select translation and reload chapter
 				m.selectedTranslation = m.translations[m.translationSelected].ShortName
 				m.mode = modeReader
@@ -676,7 +1422,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.millerFilterInput.Blur()
 				return m, nil
 			} else if m.showMillerColumns && m.books != nil && m.currentVerses != nil {
-				// Navigate to the selected verse
+				// Navigate or select reference
 				booksToUse := m.books
 				if m.millerFilter != "" && m.millerFilteredBooks != nil {
 					booksToUse = m.millerFilteredBooks
@@ -684,6 +1430,43 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.millerBookIdx < len(booksToUse) {
 					selectedBook := booksToUse[m.millerBookIdx]
 					selectedChapter := m.millerChapterIdx + 1
+					
+					if m.mode == modeReferenceSelect {
+						// Add reference instead of navigating
+						versesToUse := m.currentVerses
+						if m.millerFilter != "" && m.millerFilteredVerses != nil {
+							versesToUse = m.millerFilteredVerses
+						}
+						
+						if m.millerVerseIdx < len(versesToUse) {
+							verse := versesToUse[m.millerVerseIdx].Verse
+							ref := settings.Reference{
+								BookID:      selectedBook.BookID,
+								BookName:    selectedBook.Name,
+								Chapter:     selectedChapter,
+								Verse:       verse,
+								Translation: m.selectedTranslation,
+							}
+							m.tempReferences = append(m.tempReferences, ref)
+							
+							// Also append a text representation to the note
+							refText := fmt.Sprintf("(%s %d:%d)", ref.BookName, ref.Chapter, ref.Verse)
+							m.noteInput.SetValue(m.noteInput.Value() + refText)
+							m.noteInput.CursorEnd()
+							
+							m.mode = modeNoteInput
+							m.noteInput.SetWidth(m.width - 10)
+							m.showMillerColumns = false
+							// Restore original position
+							m.currentBook = m.originalBook
+							m.currentChapter = m.originalChapter
+							m.loading = true
+							m.originalBook = 0
+							m.originalChapter = 0
+							return m, loadChapter(m.client, m.selectedTranslation, m.currentBook, m.currentChapter)
+						}
+					}
+
 					m.currentBook = selectedBook.BookID
 					m.currentBookName = selectedBook.Name
 					m.currentChapter = selectedChapter
@@ -753,25 +1536,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						}
 					}
 
-					m.mode = modeReader
 					m.loading = true
 					return m, loadChapter(m.client, m.selectedTranslation, m.currentBook, m.currentChapter)
 				}
-			} else if m.mode == modeTranslationSelect {
-				// Simple translation selection (cycle through common ones)
-				translations := []string{"NLT", "KJV", "ASV", "WEB", "YLT", "DARBY"}
-				for i, t := range translations {
-					if t == m.selectedTranslation {
-						m.selectedTranslation = translations[(i+1)%len(translations)]
-						break
-					}
-				}
-				m.mode = modeReader
-				m.loading = true
-				return m, tea.Batch(
-					loadBooks(m.client, m.selectedTranslation),
-					loadChapter(m.client, m.selectedTranslation, m.currentBook, m.currentChapter),
-				)
 			}
 		case "x":
 			// Delete cached translation
@@ -785,6 +1552,42 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case "esc":
+			m.hKeyPending = false
+			m.nKeyPending = false
+			if m.mode == modeReferenceSelect {
+				m.mode = modeNoteInput
+				m.noteInput.SetWidth(m.width - 10)
+				m.showMillerColumns = false
+				// Restore original position
+				m.currentBook = m.originalBook
+				m.currentChapter = m.originalChapter
+				m.loading = true
+				m.originalBook = 0
+				m.originalChapter = 0
+				return m, loadChapter(m.client, m.selectedTranslation, m.currentBook, m.currentChapter)
+			}
+			if m.mode == modeReferenceList {
+				m.mode = modeNoteSidebar
+				return m, nil
+			}
+			if m.mode == modeNoteSidebar {
+				m.mode = modeReader
+				// Re-format for full width
+				m.content = m.formatChapter(m.currentVerses, m.currentBookName, m.currentChapter, m.getContentWidth(), m.highlightedVerseStart, m.highlightedVerseEnd)
+				m.viewport.SetContent(m.content)
+				return m, nil
+			}
+			if m.mode == modeWordSelect || m.mode == modeNoteInput {
+				notes := m.getChapterNotes()
+				if len(notes) > 0 {
+					m.mode = modeNoteSidebar
+				} else {
+					m.mode = modeReader
+				}
+				m.content = m.formatChapter(m.currentVerses, m.currentBookName, m.currentChapter, m.width, m.highlightedVerseStart, m.highlightedVerseEnd)
+				m.viewport.SetContent(m.content)
+				return m, nil
+			}
 			if m.mode == modeCacheManager {
 				m.mode = modeReader
 				return m, nil
@@ -802,7 +1605,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.showSidebar = false
 				return m, nil
 			}
-			if m.mode == modeSearch || m.mode == modeTranslationSelect || m.mode == modeThemeSelect || m.mode == modeAbout || m.mode == modeComparison || m.mode == modeWordSearch {
+			if m.mode == modeSearch || m.mode == modeTranslationSelect || m.mode == modeThemeSelect || m.mode == modeAbout || m.mode == modeComparison || m.mode == modeWordSearch || m.mode == modeLanguageSelect || m.mode == modeVerseHighlight {
 				m.mode = modeReader
 				m.wordSearchResults = nil
 				m.wordSearchInput.SetValue("")
@@ -811,67 +1614,451 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case tea.MouseMsg:
-		if m.showSidebar {
-			if msg.Type == tea.MouseLeft {
-				// Handle mouse clicks in sidebar
-				// Sidebar is 30 chars wide + 4 for border/padding
-				if msg.X < 34 {
-					// Calculate which book was clicked
-					// Account for header, padding, and section titles
-					clickY := msg.Y - 5 // Adjust for header and padding
-
-					if clickY >= 0 && m.books != nil {
-						bookIndex := 0
-						currentY := 0
-
-						// Skip "OLD TESTAMENT" header (2 lines)
-						if clickY < 2 {
-							return m, nil
+		if m.showMillerColumns {
+			switch msg.Type {
+			case tea.MouseWheelUp:
+				switch m.millerColumn {
+				case 0:
+					if m.millerBookIdx > 0 {
+						m.millerBookIdx--
+						m.millerChapterIdx = 0
+						m.millerVerseIdx = 0
+					}
+				case 1:
+					if m.millerChapterIdx > 0 {
+						m.millerChapterIdx--
+						m.millerVerseIdx = 0
+					}
+				case 2:
+					if m.millerVerseIdx > 0 {
+						m.millerVerseIdx--
+					}
+				}
+				return m, nil
+			case tea.MouseWheelDown:
+				switch m.millerColumn {
+				case 0:
+					booksToUse := m.books
+					if m.millerFilter != "" && m.millerFilteredBooks != nil {
+						booksToUse = m.millerFilteredBooks
+					}
+					if booksToUse != nil && m.millerBookIdx < len(booksToUse)-1 {
+						m.millerBookIdx++
+						m.millerChapterIdx = 0
+						m.millerVerseIdx = 0
+					}
+				case 1:
+					booksToUse := m.books
+					if m.millerFilter != "" && m.millerFilteredBooks != nil {
+						booksToUse = m.millerFilteredBooks
+					}
+					if booksToUse != nil && m.millerBookIdx < len(booksToUse) {
+						selectedBook := booksToUse[m.millerBookIdx]
+						if m.millerChapterIdx < selectedBook.Chapters-1 {
+							m.millerChapterIdx++
+							m.millerVerseIdx = 0
 						}
-						currentY = 2
+					}
+				case 2:
+					versesToUse := m.currentVerses
+					if m.millerFilter != "" && m.millerFilteredVerses != nil {
+						versesToUse = m.millerFilteredVerses
+					}
+					if versesToUse != nil && m.millerVerseIdx < len(versesToUse)-1 {
+						m.millerVerseIdx++
+					}
+				}
+				return m, nil
+			case tea.MouseLeft:
+				// Each column is 30 chars wide
+				columnWidth := 30
+				if msg.X >= columnWidth*3+6 {
+					m.showMillerColumns = false
+					return m, nil
+				}
 
-						// Old Testament books
-						for i, book := range m.books {
-							if book.BookID > 39 {
-								break
-							}
-							if clickY == currentY {
-								bookIndex = i
-								m.sidebarSelected = bookIndex
-								m.currentBook = m.books[bookIndex].BookID
-								m.currentBookName = m.books[bookIndex].Name
-								m.currentChapter = 1
-								m.showSidebar = false
-								m.loading = true
-								return m, loadChapter(m.client, m.selectedTranslation, m.currentBook, m.currentChapter)
-							}
-							currentY++
+				clickedColumn := msg.X / (columnWidth + 2)
+				if clickedColumn > 2 {
+					clickedColumn = 2
+				}
+
+				// If switching columns
+				if clickedColumn != m.millerColumn {
+					m.millerColumn = clickedColumn
+					// When moving to verses column, load the chapter if not already loaded
+					if m.millerColumn == 2 {
+						booksToUse := m.books
+						if m.millerFilter != "" && m.millerFilteredBooks != nil {
+							booksToUse = m.millerFilteredBooks
 						}
-
-						// Skip "NEW TESTAMENT" header (2 lines)
-						currentY += 2
-
-						// New Testament books
-						for i, book := range m.books {
-							if book.BookID < 40 {
-								continue
+						if m.millerBookIdx < len(booksToUse) {
+							selectedBook := booksToUse[m.millerBookIdx]
+							selectedChapter := m.millerChapterIdx + 1
+							if selectedBook.BookID != m.currentBook || selectedChapter != m.currentChapter {
+								return m, loadChapter(m.client, m.selectedTranslation, selectedBook.BookID, selectedChapter)
 							}
-							if clickY == currentY {
-								bookIndex = i
-								m.sidebarSelected = bookIndex
-								m.currentBook = m.books[bookIndex].BookID
-								m.currentBookName = m.books[bookIndex].Name
-								m.currentChapter = 1
-								m.showSidebar = false
-								m.loading = true
-								return m, loadChapter(m.client, m.selectedTranslation, m.currentBook, m.currentChapter)
+						}
+					}
+					return m, nil
+				}
+
+				// Map click to item within column
+				clickY := msg.Y - 2 // Account for border/padding
+				if clickY < 0 {
+					return m, nil
+				}
+
+				// Calculate startIdx and heights for mapping (same logic as renderColumn)
+				var items []string
+				var selectedIdx int
+				availableLines := m.height - 8
+				if availableLines < 1 {
+					availableLines = 1
+				}
+
+				switch m.millerColumn {
+				case 0: // Books
+					booksToUse := m.books
+					if m.millerFilter != "" && m.millerFilteredBooks != nil {
+						booksToUse = m.millerFilteredBooks
+					}
+					for _, b := range booksToUse {
+						items = append(items, b.Name)
+					}
+					selectedIdx = m.millerBookIdx
+				case 1: // Chapters
+					booksToUse := m.books
+					if m.millerFilter != "" && m.millerFilteredBooks != nil {
+						booksToUse = m.millerFilteredBooks
+					}
+					if booksToUse != nil && m.millerBookIdx < len(booksToUse) {
+						selectedBook := booksToUse[m.millerBookIdx]
+						for i := 0; i < selectedBook.Chapters; i++ {
+							items = append(items, fmt.Sprintf("Chapter %d", i+1))
+						}
+					}
+					selectedIdx = m.millerChapterIdx
+				case 2: // Verses
+					versesToUse := m.currentVerses
+					if m.millerFilter != "" && m.millerFilteredVerses != nil {
+						versesToUse = m.millerFilteredVerses
+					}
+					for _, v := range versesToUse {
+						items = append(items, fmt.Sprintf("%d. %s", v.Verse, stripHTMLTags(v.Text)))
+					}
+					selectedIdx = m.millerVerseIdx
+				}
+
+				if items == nil || len(items) == 0 {
+					return m, nil
+				}
+
+				// Same height/window logic as renderColumn
+				contentWidth := columnWidth - 4
+				heights := make([]int, len(items))
+				for i, item := range items {
+					heights[i] = lipgloss.Height(lipgloss.NewStyle().Width(contentWidth).Padding(0, 1).Render("  " + item))
+				}
+
+				startIdx := 0
+				if selectedIdx != -1 {
+					targetLines := availableLines
+					if selectedIdx > 0 {
+						targetLines--
+					}
+					if selectedIdx < len(items)-1 {
+						targetLines--
+					}
+					if targetLines < 1 {
+						targetLines = 1
+					}
+					currentLines := heights[selectedIdx]
+					startIdx = selectedIdx
+					endIdx := selectedIdx + 1
+					for {
+						expanded := false
+						if startIdx > 0 && currentLines+heights[startIdx-1] <= targetLines {
+							startIdx--
+							currentLines += heights[startIdx]
+							expanded = true
+						}
+						if endIdx < len(items) && currentLines+heights[endIdx] <= targetLines {
+							currentLines += heights[endIdx]
+							endIdx++
+							expanded = true
+						}
+						if !expanded || currentLines >= targetLines {
+							break
+						}
+					}
+				}
+
+				// Map clickY to item
+				currentY := 2 // Header + blank line
+				if startIdx > 0 {
+					if clickY == currentY { // Clicked "... above"
+						switch m.millerColumn {
+						case 0:
+							if m.millerBookIdx > 0 {
+								m.millerBookIdx--
+								m.millerChapterIdx = 0
+								m.millerVerseIdx = 0
+								
+								booksToUse := m.books
+								if m.millerFilter != "" && m.millerFilteredBooks != nil {
+									booksToUse = m.millerFilteredBooks
+								}
+								if m.millerBookIdx < len(booksToUse) {
+									selectedBook := booksToUse[m.millerBookIdx]
+									return m, loadChapter(m.client, m.selectedTranslation, selectedBook.BookID, 1)
+								}
 							}
-							currentY++
+						case 1:
+							if m.millerChapterIdx > 0 {
+								m.millerChapterIdx--
+								m.millerVerseIdx = 0
+								
+								booksToUse := m.books
+								if m.millerFilter != "" && m.millerFilteredBooks != nil {
+									booksToUse = m.millerFilteredBooks
+								}
+								if m.millerBookIdx < len(booksToUse) {
+									selectedBook := booksToUse[m.millerBookIdx]
+									return m, loadChapter(m.client, m.selectedTranslation, selectedBook.BookID, m.millerChapterIdx+1)
+								}
+							}
+						case 2:
+							if m.millerVerseIdx > 0 {
+								m.millerVerseIdx--
+							}
+						}
+						return m, nil
+					}
+					currentY++
+				}
+
+				for i := startIdx; i < len(items); i++ {
+					if clickY >= currentY && clickY < currentY+heights[i] {
+						// Found the item
+						switch m.millerColumn {
+						case 0:
+							m.millerBookIdx = i
+							m.millerChapterIdx = 0
+							m.millerVerseIdx = 0
+							
+							booksToUse := m.books
+							if m.millerFilter != "" && m.millerFilteredBooks != nil {
+								booksToUse = m.millerFilteredBooks
+							}
+							if m.millerBookIdx < len(booksToUse) {
+								selectedBook := booksToUse[m.millerBookIdx]
+								return m, loadChapter(m.client, m.selectedTranslation, selectedBook.BookID, 1)
+							}
+						case 1:
+							m.millerChapterIdx = i
+							m.millerVerseIdx = 0
+							
+							booksToUse := m.books
+							if m.millerFilter != "" && m.millerFilteredBooks != nil {
+								booksToUse = m.millerFilteredBooks
+							}
+							if m.millerBookIdx < len(booksToUse) {
+								selectedBook := booksToUse[m.millerBookIdx]
+								return m, loadChapter(m.client, m.selectedTranslation, selectedBook.BookID, m.millerChapterIdx+1)
+							}
+						case 2:
+							m.millerVerseIdx = i
+							// On double click or already selected, we might want to navigate
+							// For now, just selecting is enough as it updates Column 1/2/3
+						}
+						return m, nil
+					}
+					currentY += heights[i]
+					if currentY > clickY {
+						break
+					}
+				}
+
+				// Handle "more below" click
+				if clickY == currentY && currentY < availableLines+3 {
+					switch m.millerColumn {
+					case 0:
+						booksToUse := m.books
+						if m.millerFilter != "" && m.millerFilteredBooks != nil {
+							booksToUse = m.millerFilteredBooks
+						}
+						if booksToUse != nil && m.millerBookIdx < len(booksToUse)-1 {
+							m.millerBookIdx++
+							m.millerChapterIdx = 0
+							m.millerVerseIdx = 0
+							selectedBook := booksToUse[m.millerBookIdx]
+							return m, loadChapter(m.client, m.selectedTranslation, selectedBook.BookID, 1)
+						}
+					case 1:
+						booksToUse := m.books
+						if m.millerFilter != "" && m.millerFilteredBooks != nil {
+							booksToUse = m.millerFilteredBooks
+						}
+						if booksToUse != nil && m.millerBookIdx < len(booksToUse) {
+							selectedBook := booksToUse[m.millerBookIdx]
+							if m.millerChapterIdx < selectedBook.Chapters-1 {
+								m.millerChapterIdx++
+								m.millerVerseIdx = 0
+								return m, loadChapter(m.client, m.selectedTranslation, selectedBook.BookID, m.millerChapterIdx+1)
+							}
+						}
+					case 2:
+						versesToUse := m.currentVerses
+						if m.millerFilter != "" && m.millerFilteredVerses != nil {
+							versesToUse = m.millerFilteredVerses
+						}
+						if versesToUse != nil && m.millerVerseIdx < len(versesToUse)-1 {
+							m.millerVerseIdx++
 						}
 					}
 				}
 			}
+			return m, nil
+		}
+
+		if m.showSidebar {
+			// Handle all mouse events when sidebar is open to prevent fallthrough
+			switch msg.Type {
+			case tea.MouseWheelUp:
+				if m.sidebarSelected > 0 {
+					m.sidebarSelected--
+				}
+				return m, nil
+			case tea.MouseWheelDown:
+				if m.books != nil && m.sidebarSelected < len(m.books)-1 {
+					m.sidebarSelected++
+				}
+				return m, nil
+			case tea.MouseLeft:
+				sidebarWidth := 30
+				// sidebarWidth + border/shadow (approx 4 chars)
+				if msg.X < sidebarWidth+4 {
+					// We need the heights of entries to map the click
+					// Re-calculating logic from renderSidebar for click mapping
+					contentWidth := sidebarWidth - 4
+					if contentWidth < 10 { contentWidth = 10 }
+					
+					entries := m.getSidebarEntries()
+					if entries == nil { return m, nil }
+
+					// Calculate heights (same logic as renderSidebar)
+					selectedIdx := -1
+					for i, entry := range entries {
+						var h int
+						if entry.isHeader {
+							if entry.headerText == "" {
+								h = 1
+							} else {
+								h = lipgloss.Height(lipgloss.NewStyle().Padding(0, 1).Width(contentWidth).Bold(true).Render(entry.headerText))
+							}
+						} else {
+							if entry.bookIndex == m.sidebarSelected { selectedIdx = i }
+							h = lipgloss.Height(lipgloss.NewStyle().Padding(0, 1).Width(contentWidth).Render("  " + entry.book.Name))
+						}
+						entries[i].height = h
+					}
+
+					// Find startIdx/endIdx (same logic as renderSidebar)
+					availableLines := m.height - 6
+					if availableLines < 1 { availableLines = 1 }
+					
+					startIdx := 0
+					if selectedIdx != -1 {
+						reservedForMore := 0
+						if selectedIdx > 0 { reservedForMore++ }
+						if selectedIdx < len(entries)-1 { reservedForMore++ }
+						targetLines := availableLines - reservedForMore
+						if targetLines < 1 { targetLines = 1 }
+						
+						currentLines := entries[selectedIdx].height
+						startIdx = selectedIdx
+						endIdx := selectedIdx + 1
+						for {
+							expanded := false
+							if startIdx > 0 && currentLines + entries[startIdx-1].height <= targetLines {
+								startIdx--
+								currentLines += entries[startIdx].height
+								expanded = true
+							}
+							if endIdx < len(entries) && currentLines + entries[endIdx].height <= targetLines {
+								currentLines += entries[endIdx].height
+								endIdx++
+								expanded = true
+							}
+							if !expanded || currentLines >= targetLines { break }
+						}
+					}
+
+					// Now map clickY to entry
+					clickY := msg.Y - 2 // Account for border/padding
+					if clickY < 0 { return m, nil }
+
+					currentY := 0
+					if startIdx > 0 {
+						if clickY == 0 {
+							// Clicked "more above"
+							if m.sidebarSelected > 0 { m.sidebarSelected-- }
+							return m, nil
+						}
+						currentY = 1 // Start after "more above" indicator
+					}
+
+					for i := startIdx; i < len(entries); i++ {
+						if clickY >= currentY && clickY < currentY+entries[i].height {
+							entry := entries[i]
+							if !entry.isHeader {
+								m.sidebarSelected = entry.bookIndex
+								m.currentBook = entry.book.BookID
+								m.currentBookName = entry.book.Name
+								m.currentChapter = 1
+								m.showSidebar = false
+								m.loading = true
+								m.highlightedVerseStart = 0
+								m.highlightedVerseEnd = 0
+								return m, loadChapter(m.client, m.selectedTranslation, m.currentBook, m.currentChapter)
+							}
+							return m, nil
+						}
+						currentY += entries[i].height
+						// Stop if we've passed the click point
+						if currentY > clickY { break }
+					}
+					
+					// If we're at the very bottom and there's a "more below" indicator
+					if clickY == currentY && currentY < availableLines {
+						if m.books != nil && m.sidebarSelected < len(m.books)-1 {
+							m.sidebarSelected++
+						}
+						return m, nil
+					}
+				} else {
+					// Clicked outside sidebar - close it
+					m.showSidebar = false
+					return m, nil
+				}
+			}
+			// Intercept all other mouse events
+			return m, nil
 		} else {
+			// Reader mode mouse interactions
+			if msg.Type == tea.MouseLeft && msg.Shift {
+				// Potential highlight action
+				// Mapping screen click to verse character is complex in TUI, 
+				// for now we'll support the keyboard-based highlighting primarily
+				// but we can enter highlight mode on Shift+Click
+				if m.mode == modeReader {
+					m.mode = modeVerseHighlight
+					m.verseCursorPos = 0 // Approximate
+					m.selectionStart = 0
+				}
+				return m, nil
+			}
+
 			// Pass mouse events to viewport for scrolling
 			m.viewport, cmd = m.viewport.Update(msg)
 			cmds = append(cmds, cmd)
@@ -881,22 +2068,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 
+		// Update note input width
+		m.noteInput.SetWidth(m.width - 10)
+
 		if !m.ready {
 			m.viewport = viewport.New(msg.Width, msg.Height-6)
 			m.viewport.YPosition = 4
 			m.ready = true
 		} else {
-			m.viewport.Width = msg.Width
+			m.viewport.Width = m.getContentWidth()
 			m.viewport.Height = msg.Height - 6
 		}
 
 		// Reformat content with new width
 		if m.currentVerses != nil {
-			m.content = m.formatChapter(m.currentVerses, m.currentBookName, m.currentChapter, m.width, m.highlightedVerseStart, m.highlightedVerseEnd)
+			m.content = m.formatChapter(m.currentVerses, m.currentBookName, m.currentChapter, m.getContentWidth(), m.highlightedVerseStart, m.highlightedVerseEnd)
 		} else if m.currentParallelVerses != nil {
-			m.content = m.formatParallelVerses(m.currentParallelVerses, m.comparisonTranslations, m.currentBookName, m.currentChapter, m.width)
+			m.content = m.formatParallelVerses(m.currentParallelVerses, m.comparisonTranslations, m.currentBookName, m.currentChapter, m.getContentWidth())
 		}
 		m.viewport.SetContent(m.content)
+
+	case languagesLoadedMsg:
+		m.languages = msg.languages
 
 	case translationsLoadedMsg:
 		m.translations = msg.translations
@@ -914,8 +2107,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.loading = false
 		m.currentVerses = msg.verses
 		m.currentParallelVerses = nil
-		// Track if we came from a search (highlighted verse was set)
-		cameFromSearch := m.highlightedVerseStart > 1
+		// Track if we came from a search or reference (highlighted verse was set)
+		cameFromSearch := m.highlightedVerseStart > 0
 		// Initialize highlighted verse to first verse or use the range from search
 		if m.highlightedVerseStart == 0 {
 			if len(msg.verses) > 0 {
@@ -983,6 +2176,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if m.mode == modeSearch {
 		m.textInput, cmd = m.textInput.Update(msg)
 		cmds = append(cmds, cmd)
+	} else if m.mode == modeNoteInput {
+		m.noteInput, cmd = m.noteInput.Update(msg)
+		cmds = append(cmds, cmd)
 	} else if m.mode == modeWordSearch && m.wordSearchResults == nil && !m.wordSearchLoading {
 		// Update word search input when typing query
 		m.wordSearchInput, cmd = m.wordSearchInput.Update(msg)
@@ -998,7 +2194,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.millerFilter = newFilter
 			m.applyMillerFilter()
 			m.millerBookIdx = 0
+			m.millerChapterIdx = 0
 			m.millerVerseIdx = 0
+			m.millerFilteredVerses = nil
 		}
 	} else {
 		oldYOffset := m.viewport.YOffset
@@ -1031,7 +2229,8 @@ func (m Model) View() string {
 		Foreground(m.currentTheme.Accent).
 		BorderStyle(lipgloss.NormalBorder()).
 		BorderBottom(true).
-		BorderForeground(m.currentTheme.Border)
+		BorderForeground(m.currentTheme.Border).
+		Width(m.width)
 
 	titleStyle := lipgloss.NewStyle().
 		Bold(true).
@@ -1053,8 +2252,18 @@ func (m Model) View() string {
 	var header string
 	if m.mode == modeSearch {
 		header = headerStyle.Render(logoStyle.Render(logo)+" Search - Enter verse reference") + "\n" + m.textInput.View()
+	} else if m.mode == modeLanguageSelect {
+		header = headerStyle.Render(logoStyle.Render(logo) + " Select Language")
+	} else if m.mode == modeHighlightSettings {
+		header = headerStyle.Render(logoStyle.Render(logo) + " Select Highlight Color")
+	} else if m.mode == modeVerseHighlight {
+		header = headerStyle.Render(logoStyle.Render(logo) + " Verse Highlighting")
+	} else if m.mode == modeWordSelect {
+		header = headerStyle.Render(logoStyle.Render(logo) + " Select Word for Note")
+	} else if m.mode == modeNoteInput {
+		header = headerStyle.Render(logoStyle.Render(logo) + " Enter Note")
 	} else if m.mode == modeTranslationSelect {
-		header = headerStyle.Render(logoStyle.Render(logo) + " Select Translation")
+		header = headerStyle.Render(logoStyle.Render(logo) + " Select Translation - " + m.selectedLanguage)
 	} else if m.mode == modeThemeSelect {
 		header = headerStyle.Render(logoStyle.Render(logo) + " Select Theme")
 	} else if m.mode == modeComparison {
@@ -1065,6 +2274,10 @@ func (m Model) View() string {
 		header = headerStyle.Render(logoStyle.Render(logo) + " About")
 	} else if m.mode == modeWordSearch {
 		header = headerStyle.Render(logoStyle.Render(logo) + " Search Bible")
+	} else if m.mode == modeReferenceSelect {
+		header = headerStyle.Render(logoStyle.Render(logo) + " Select Reference for Note")
+	} else if m.mode == modeReferenceList {
+		header = headerStyle.Render(logoStyle.Render(logo) + " Select Reference to Navigate")
 	} else {
 		// Check if current translation is cached
 		offlineIndicator := ""
@@ -1109,6 +2322,16 @@ func (m Model) View() string {
 	var helpText string
 	if m.loading {
 		helpText = "Loading..."
+	} else if m.mode == modeHighlightSettings {
+		helpText = "↑/↓ or j/k: navigate | enter: select | esc: close"
+	} else if m.mode == modeVerseHighlight {
+		helpText = "h/j/k/l: move cursor | Shift+move: highlight | enter: save | d: delete | esc: cancel"
+	} else if m.mode == modeWordSelect {
+		helpText = "h/l: select word | enter: add/edit note | esc: cancel"
+	} else if m.mode == modeNoteInput {
+		helpText = "type note... | ctrl+r: add ref | enter: save | esc: cancel"
+	} else if m.mode == modeLanguageSelect {
+		helpText = "↑/↓ or j/k: navigate | enter: select | esc: close"
 	} else if m.mode == modeTranslationSelect {
 		helpText = "↑/↓ or j/k: navigate | enter: select | esc: close"
 	} else if m.mode == modeThemeSelect {
@@ -1128,30 +2351,101 @@ func (m Model) View() string {
 	} else if m.showMillerColumns && m.millerFilterMode {
 		helpText = "Type to filter | enter/esc: exit filter mode"
 	} else if m.showMillerColumns {
-		helpText = "↑/↓ or j/k: navigate | ←/→ or h/l: switch column | /: filter | enter: select | v/esc: close"
+		if m.mode == modeReferenceSelect {
+			helpText = "↑/↓ or j/k: navigate | ←/→ or h/l: switch column | enter: select reference | esc: cancel"
+		} else {
+			helpText = "↑/↓ or j/k: navigate | ←/→ or h/l: switch column | /: filter | enter: select | v/esc: close"
+		}
 	} else if m.showSidebar {
 		helpText = "↑/↓ or j/k: navigate | enter: select | [/esc: close"
+	} else if m.mode == modeNoteSidebar || m.mode == modeReferenceList {
+		helpText = "↑/↓ or j/k: navigate | enter: edit | g: go to ref | a: add | d: delete | esc: back"
 	} else {
-		helpText = "[: books | v: verse picker | /: search | s: word search | c: compare | t: translation | T: theme | d: download | y: yank | ?: about | q: quit"
+		helpText = "[: books | v: verse picker | /: search | s: word search | c: compare | l: language | t: translation | T: theme | d: download | h: highlight | N: notes | n/p: next/prev | y: yank | ?: about | q: quit"
 	}
 
-	// Calculate padding to right-align version
-	helpLen := len(helpText)
-	versionLen := len(versionString)
-	totalLen := helpLen + versionLen + 3 // 3 for spacing
-	padding := ""
-	if m.width > totalLen {
-		padding = strings.Repeat(" ", m.width-totalLen)
+	// Calculate help and version
+	hText := helpStyle.Render(helpText)
+	vText := versionStyle.Render(versionString)
+	
+	var help string
+	// Create a layout where help is on the left and version is on the right
+	// If it needs to wrap, help will wrap and version will be pushed
+	paddingCount := m.width - lipgloss.Width(hText) - lipgloss.Width(vText) - 2
+	if paddingCount < 1 {
+		// If they don't fit on one line, allow wrapping
+		help = statusBarStyle.Width(m.width).Render(hText + "\n" + vText)
+	} else {
+		padding := strings.Repeat(" ", paddingCount)
+		help = statusBarStyle.Width(m.width).Render(hText + padding + vText)
 	}
-
-	help := statusBarStyle.Render(helpStyle.Render(helpText) + padding + versionStyle.Render(versionString))
 
 	var errorMsg string
 	if m.err != nil {
-		errorMsg = "\n" + errorStyle.Render(fmt.Sprintf("Error: %v", m.err))
+		errorMsg = errorStyle.Render(fmt.Sprintf("Error: %v", m.err))
 	}
 
-	mainContent := fmt.Sprintf("%s\n%s\n%s%s", header, m.viewport.View(), help, errorMsg)
+	// Calculate dynamic viewport height based on actual height of header and help
+	headerHeight := lipgloss.Height(header)
+	helpHeight := lipgloss.Height(help)
+	errorHeight := 0
+	if errorMsg != "" {
+		errorHeight = lipgloss.Height(errorMsg)
+	}
+
+	// Viewport height is whatever is left
+	m.viewport.Height = m.height - headerHeight - helpHeight - errorHeight
+	if m.viewport.Height < 1 {
+		m.viewport.Height = 1
+	}
+
+	// Side content for notes
+	var sideContent string
+	sidebarWidth := 35
+	if m.mode == modeNoteSidebar || m.mode == modeWordSelect || m.mode == modeNoteInput || m.mode == modeReferenceList {
+		sideContent = m.renderNoteSidebar()
+	}
+
+	var viewportView string
+	if sideContent != "" {
+		m.viewport.Width = m.getContentWidth()
+		
+		sidebar := lipgloss.NewStyle().
+			Width(sidebarWidth).
+			Height(m.viewport.Height).
+			Border(lipgloss.NormalBorder(), false, false, false, true).
+			BorderForeground(m.currentTheme.Border).
+			Padding(0, 1).
+			Render(sideContent)
+		
+		viewportView = lipgloss.JoinHorizontal(lipgloss.Top, m.viewport.View(), sidebar)
+	} else {
+		m.viewport.Width = m.getContentWidth()
+		viewportView = m.viewport.View()
+	}
+
+	var mainContent string
+	if errorMsg != "" {
+		mainContent = lipgloss.JoinVertical(lipgloss.Left, header, viewportView, help, errorMsg)
+	} else {
+		mainContent = lipgloss.JoinVertical(lipgloss.Left, header, viewportView, help)
+	}
+
+	// Force the view to be exactly m.height to clear any stale lines from previous renders
+	finalView := lipgloss.NewStyle().
+		Height(m.height).
+		MaxHeight(m.height).
+		Width(m.width).
+		MaxWidth(m.width).
+		Render(mainContent)
+
+	if m.mode == modeLanguageSelect {
+		return m.renderLanguageSelect(header, help, errorMsg)
+	}
+
+	if m.mode == modeHighlightSettings {
+		return m.renderHighlightSettings(header, help, errorMsg)
+	}
 
 	if m.mode == modeTranslationSelect {
 		return m.renderTranslationSelect(header, help, errorMsg)
@@ -1169,6 +2463,10 @@ func (m Model) View() string {
 		return m.renderAbout(header, help, errorMsg)
 	}
 
+	if m.mode == modeNoteInput {
+		return m.renderNoteInput(header, help, errorMsg)
+	}
+
 	if m.mode == modeWordSearch {
 		return m.renderWordSearch(header, help, errorMsg)
 	}
@@ -1176,16 +2474,16 @@ func (m Model) View() string {
 	if m.showMillerColumns {
 		millerColumns := m.renderMillerColumns()
 		// Overlay Miller columns on top of the main content
-		return overlayContent(mainContent, millerColumns, m.width, m.height)
+		return overlayContent(finalView, millerColumns, m.width, m.height)
 	}
 
 	if m.showSidebar {
 		sidebar := m.renderSidebar()
 		// Overlay the sidebar on top of the main content
-		return overlayContent(mainContent, sidebar, m.width, m.height)
+		return overlayContent(finalView, sidebar, m.width, m.height)
 	}
 
-	return mainContent
+	return finalView
 }
 
 func (m Model) calculateHighlightedVerse() int {
@@ -1457,12 +2755,17 @@ func overlayContent(base, overlay string, width, height int) string {
 
 func (m Model) renderMillerColumns() string {
 	columnWidth := 30
+	contentWidth := columnWidth - 4
+	if contentWidth < 10 {
+		contentWidth = 10
+	}
 
 	columnStyle := lipgloss.NewStyle().
 		Width(columnWidth).
 		Height(m.height - 2).
 		Border(lipgloss.NormalBorder()).
 		BorderForeground(m.currentTheme.Border).
+		Background(m.currentTheme.Background).
 		Padding(1)
 
 	activeColumnStyle := lipgloss.NewStyle().
@@ -1477,181 +2780,164 @@ func (m Model) renderMillerColumns() string {
 		Foreground(m.currentTheme.Accent).
 		Background(m.currentTheme.Background).
 		Bold(true).
-		Padding(0, 1)
+		Padding(0, 1).
+		Width(contentWidth)
 
 	normalStyle := lipgloss.NewStyle().
 		Foreground(m.currentTheme.Primary).
-		Padding(0, 1)
+		Background(m.currentTheme.Background).
+		Padding(0, 1).
+		Width(contentWidth)
 
 	headerStyle := lipgloss.NewStyle().
 		Foreground(m.currentTheme.Success).
 		Background(m.currentTheme.Background).
 		Bold(true).
 		Padding(0, 1).
-		Width(columnWidth - 2)
+		Width(contentWidth)
 
-	// Column 1: Books
-	var booksContent strings.Builder
-	booksContent.WriteString(headerStyle.Render("BOOKS") + "\n")
-
-	// Show filter input if in books column
-	if m.millerColumn == 0 && m.millerFilterMode {
-		booksContent.WriteString(m.millerFilterInput.View() + "\n")
-	} else if m.millerColumn == 0 && m.millerFilter != "" {
-		filterStyle := lipgloss.NewStyle().Foreground(m.currentTheme.Warning)
-		booksContent.WriteString(filterStyle.Render("Filter: "+m.millerFilter) + "\n\n")
-	} else {
-		booksContent.WriteString("\n")
+	availableLines := m.height - 8
+	if availableLines < 1 {
+		availableLines = 1
 	}
 
-	// Use filtered books if filter is active, otherwise use all books
-	booksToDisplay := m.books
-	if m.millerColumn == 0 && m.millerFilter != "" && m.millerFilteredBooks != nil {
-		booksToDisplay = m.millerFilteredBooks
-	}
+	// Helper to render a column with wrapping and virtual scrolling
+	renderColumn := func(title string, items []string, selectedIdx int, showFilter bool, filter string) string {
+		var sb strings.Builder
+		sb.WriteString(headerStyle.Render(title) + "\n")
 
-	if booksToDisplay != nil {
-		visibleItems := m.height - 8
-		if visibleItems < 5 {
-			visibleItems = 5
+		if showFilter && m.millerFilterMode {
+			sb.WriteString(m.millerFilterInput.View() + "\n")
+		} else if showFilter && filter != "" {
+			filterStyle := lipgloss.NewStyle().Foreground(m.currentTheme.Warning).Background(m.currentTheme.Background)
+			sb.WriteString(filterStyle.Render("Filter: "+filter) + "\n\n")
+		} else {
+			sb.WriteString("\n")
 		}
 
-		startIdx := m.millerBookIdx - visibleItems/2
-		if startIdx < 0 {
-			startIdx = 0
+		if items == nil || len(items) == 0 {
+			if title == "VERSES" {
+				sb.WriteString(normalStyle.Render("  Loading..."))
+			}
+			return sb.String()
 		}
-		endIdx := startIdx + visibleItems
-		if endIdx > len(booksToDisplay) {
-			endIdx = len(booksToDisplay)
-			startIdx = endIdx - visibleItems
-			if startIdx < 0 {
-				startIdx = 0
+
+		// Calculate heights of all items
+		heights := make([]int, len(items))
+		rendered := make([]string, len(items))
+		for i, item := range items {
+			prefix := "  "
+			style := normalStyle
+			if i == selectedIdx {
+				prefix = "> "
+				style = selectedStyle
+			}
+			text := style.Render(prefix + item)
+			rendered[i] = text + "\n"
+			heights[i] = lipgloss.Height(text)
+		}
+
+		// Calculate window
+		startIdx := 0
+		endIdx := len(items)
+		if selectedIdx != -1 {
+			targetLines := availableLines
+			if selectedIdx > 0 {
+				targetLines--
+			}
+			if selectedIdx < len(items)-1 {
+				targetLines--
+			}
+			if targetLines < 1 {
+				targetLines = 1
+			}
+
+			currentLines := heights[selectedIdx]
+			startIdx = selectedIdx
+			endIdx = selectedIdx + 1
+
+			for {
+				expanded := false
+				if startIdx > 0 && currentLines+heights[startIdx-1] <= targetLines {
+					startIdx--
+					currentLines += heights[startIdx]
+					expanded = true
+				}
+				if endIdx < len(items) && currentLines+heights[endIdx] <= targetLines {
+					currentLines += heights[endIdx]
+					endIdx++
+					expanded = true
+				}
+				if !expanded || currentLines >= targetLines {
+					break
+				}
 			}
 		}
 
 		if startIdx > 0 {
-			booksContent.WriteString(normalStyle.Render(fmt.Sprintf("... (%d)\n", startIdx)))
+			sb.WriteString(normalStyle.Render(fmt.Sprintf("... (%d above)", startIdx)) + "\n")
+		}
+		for i := startIdx; i < endIdx; i++ {
+			sb.WriteString(rendered[i])
+		}
+		if endIdx < len(items) {
+			sb.WriteString(normalStyle.Render(fmt.Sprintf("... (%d below)", len(items)-endIdx)))
 		}
 
-		for i := startIdx; i < endIdx && i < len(booksToDisplay); i++ {
-			book := booksToDisplay[i]
-			name := book.Name
-			if len(name) > 26 {
-				name = name[:23] + "..."
-			}
-
-			if i == m.millerBookIdx {
-				booksContent.WriteString(selectedStyle.Render("> "+name) + "\n")
-			} else {
-				booksContent.WriteString(normalStyle.Render("  "+name) + "\n")
-			}
-		}
-
-		if endIdx < len(booksToDisplay) {
-			booksContent.WriteString(normalStyle.Render(fmt.Sprintf("... (%d)\n", len(booksToDisplay)-endIdx)))
-		}
+		return sb.String()
 	}
 
+	// Column 1: Books
+	booksToDisplay := m.books
+	if m.millerFilter != "" && m.millerFilteredBooks != nil {
+		booksToDisplay = m.millerFilteredBooks
+	}
+	var bookNames []string
+	for _, b := range booksToDisplay {
+		bookNames = append(bookNames, b.Name)
+	}
+	booksContent := renderColumn("BOOKS", bookNames, m.millerBookIdx, m.millerColumn == 0, m.millerFilter)
 	var booksColumn string
 	if m.millerColumn == 0 {
-		booksColumn = activeColumnStyle.Render(booksContent.String())
+		booksColumn = activeColumnStyle.Render(booksContent)
 	} else {
-		booksColumn = columnStyle.Render(booksContent.String())
+		booksColumn = columnStyle.Render(booksContent)
 	}
 
 	// Column 2: Chapters
-	var chaptersContent strings.Builder
-	chaptersContent.WriteString(headerStyle.Render("CHAPTERS") + "\n\n")
-
+	var chapterNames []string
 	if m.books != nil && m.millerBookIdx < len(m.books) {
 		selectedBook := m.books[m.millerBookIdx]
+		if m.millerFilter != "" && m.millerFilteredBooks != nil && m.millerBookIdx < len(m.millerFilteredBooks) {
+			selectedBook = m.millerFilteredBooks[m.millerBookIdx]
+		}
 		for i := 0; i < selectedBook.Chapters; i++ {
-			chapterNum := fmt.Sprintf("Chapter %d", i+1)
-			if i == m.millerChapterIdx {
-				chaptersContent.WriteString(selectedStyle.Render("> "+chapterNum) + "\n")
-			} else {
-				chaptersContent.WriteString(normalStyle.Render("  "+chapterNum) + "\n")
-			}
+			chapterNames = append(chapterNames, fmt.Sprintf("Chapter %d", i+1))
 		}
 	}
-
+	chaptersContent := renderColumn("CHAPTERS", chapterNames, m.millerChapterIdx, m.millerColumn == 1, "")
 	var chaptersColumn string
 	if m.millerColumn == 1 {
-		chaptersColumn = activeColumnStyle.Render(chaptersContent.String())
+		chaptersColumn = activeColumnStyle.Render(chaptersContent)
 	} else {
-		chaptersColumn = columnStyle.Render(chaptersContent.String())
+		chaptersColumn = columnStyle.Render(chaptersContent)
 	}
 
 	// Column 3: Verses
-	var versesContent strings.Builder
-	versesContent.WriteString(headerStyle.Render("VERSES") + "\n")
-
-	// Show filter input if in verses column
-	if m.millerColumn == 2 && m.millerFilterMode {
-		versesContent.WriteString(m.millerFilterInput.View() + "\n")
-	} else if m.millerColumn == 2 && m.millerFilter != "" {
-		filterStyle := lipgloss.NewStyle().Foreground(m.currentTheme.Warning)
-		versesContent.WriteString(filterStyle.Render("Filter: "+m.millerFilter) + "\n\n")
-	} else {
-		versesContent.WriteString("\n")
-	}
-
-	// Use filtered verses if filter is active, otherwise use all verses
 	versesToDisplay := m.currentVerses
-	if m.millerColumn == 2 && m.millerFilter != "" && m.millerFilteredVerses != nil {
+	if m.millerFilter != "" && m.millerFilteredVerses != nil {
 		versesToDisplay = m.millerFilteredVerses
 	}
-
-	if versesToDisplay != nil {
-		visibleItems := m.height - 8
-		if visibleItems < 5 {
-			visibleItems = 5
-		}
-
-		startIdx := m.millerVerseIdx - visibleItems/2
-		if startIdx < 0 {
-			startIdx = 0
-		}
-		endIdx := startIdx + visibleItems
-		if endIdx > len(versesToDisplay) {
-			endIdx = len(versesToDisplay)
-			startIdx = endIdx - visibleItems
-			if startIdx < 0 {
-				startIdx = 0
-			}
-		}
-
-		if startIdx > 0 {
-			versesContent.WriteString(normalStyle.Render(fmt.Sprintf("... (%d)\n", startIdx)))
-		}
-
-		for i := startIdx; i < endIdx && i < len(versesToDisplay); i++ {
-			verse := versesToDisplay[i]
-			text := stripHTMLTags(verse.Text)
-			if len(text) > 23 {
-				text = text[:20] + "..."
-			}
-			verseLabel := fmt.Sprintf("%d. %s", verse.Verse, text)
-
-			if i == m.millerVerseIdx {
-				versesContent.WriteString(selectedStyle.Render("> "+verseLabel) + "\n")
-			} else {
-				versesContent.WriteString(normalStyle.Render("  "+verseLabel) + "\n")
-			}
-		}
-
-		if endIdx < len(versesToDisplay) {
-			versesContent.WriteString(normalStyle.Render(fmt.Sprintf("... (%d)\n", len(versesToDisplay)-endIdx)))
-		}
-	} else {
-		versesContent.WriteString(normalStyle.Render("  Loading..."))
+	var verseLabels []string
+	for _, v := range versesToDisplay {
+		verseLabels = append(verseLabels, fmt.Sprintf("%d. %s", v.Verse, stripHTMLTags(v.Text)))
 	}
-
+	versesContent := renderColumn("VERSES", verseLabels, m.millerVerseIdx, m.millerColumn == 2, m.millerFilter)
 	var versesColumn string
 	if m.millerColumn == 2 {
-		versesColumn = activeColumnStyle.Render(versesContent.String())
+		versesColumn = activeColumnStyle.Render(versesContent)
 	} else {
-		versesColumn = columnStyle.Render(versesContent.String())
+		versesColumn = columnStyle.Render(versesContent)
 	}
 
 	// Join the three columns horizontally
@@ -1675,14 +2961,14 @@ func (m Model) renderMillerColumns() string {
 	}
 
 	// Combine columns with shadow
-	var columnsWithShadow strings.Builder
+	var result strings.Builder
 	for i := 0; i < len(columnsLines); i++ {
-		columnsWithShadow.WriteString(columnsLines[i])
+		result.WriteString(columnsLines[i])
 		if i < len(shadowLines) {
-			columnsWithShadow.WriteString(shadowLines[i])
+			result.WriteString(shadowLines[i])
 		}
 		if i < len(columnsLines)-1 {
-			columnsWithShadow.WriteString("\n")
+			result.WriteString("\n")
 		}
 	}
 
@@ -1704,12 +2990,60 @@ func (m Model) renderMillerColumns() string {
 	statusBar := statusBarStyle.Render(statusText)
 
 	// Join columns and status bar vertically
-	return lipgloss.JoinVertical(lipgloss.Left, columnsWithShadow.String(), statusBar)
+	return lipgloss.JoinVertical(lipgloss.Left, result.String(), statusBar)
+}
+
+// sidebarEntry represents a single item in the sidebar (header, book, or space)
+type sidebarEntry struct {
+	isHeader   bool
+	headerText string
+	bookIndex  int
+	book       api.Book
+	height     int // calculated during render
+}
+
+func (m Model) getSidebarEntries() []sidebarEntry {
+	if m.books == nil {
+		return nil
+	}
+
+	var entries []sidebarEntry
+
+	// Old Testament header
+	entries = append(entries, sidebarEntry{isHeader: true, headerText: "OLD TESTAMENT"})
+
+	// Old Testament books
+	for i, book := range m.books {
+		if book.BookID > 39 {
+			break
+		}
+		entries = append(entries, sidebarEntry{isHeader: false, bookIndex: i, book: book})
+	}
+
+	// New Testament header (with spacing)
+	entries = append(entries, sidebarEntry{isHeader: true, headerText: ""}) // blank line
+	entries = append(entries, sidebarEntry{isHeader: true, headerText: "NEW TESTAMENT"})
+
+	// New Testament books
+	for i, book := range m.books {
+		if book.BookID < 40 {
+			continue
+		}
+		entries = append(entries, sidebarEntry{isHeader: false, bookIndex: i, book: book})
+	}
+
+	return entries
 }
 
 func (m Model) renderSidebar() string {
+	sidebarWidth := 30
+	contentWidth := sidebarWidth - 4
+	if contentWidth < 10 {
+		contentWidth = 10
+	}
+
 	sidebarStyle := lipgloss.NewStyle().
-		Width(30).
+		Width(sidebarWidth).
 		Height(m.height - 2).
 		Border(lipgloss.NormalBorder()).
 		BorderForeground(m.currentTheme.BorderActive).
@@ -1720,127 +3054,129 @@ func (m Model) renderSidebar() string {
 		Foreground(m.currentTheme.Accent).
 		Background(m.currentTheme.Background).
 		Bold(true).
-		Padding(0, 1)
+		Padding(0, 1).
+		Width(contentWidth)
 
 	normalStyle := lipgloss.NewStyle().
 		Foreground(m.currentTheme.Primary).
-		Padding(0, 1)
+		Background(m.currentTheme.Background).
+		Padding(0, 1).
+		Width(contentWidth)
 
 	sectionHeaderStyle := lipgloss.NewStyle().
 		Foreground(m.currentTheme.Success).
 		Background(m.currentTheme.Background).
 		Bold(true).
 		Padding(0, 1).
-		Width(28)
+		Width(contentWidth)
 
 	moreStyle := lipgloss.NewStyle().
 		Foreground(m.currentTheme.Muted).
+		Background(m.currentTheme.Background).
 		Italic(true).
-		Padding(0, 1)
+		Padding(0, 1).
+		Width(contentWidth)
 
-	var sb strings.Builder
+	// Internal height: total - borders - padding
+	availableLines := m.height - 6
+	if availableLines < 1 {
+		availableLines = 1
+	}
 
-	if m.books != nil {
-		// Calculate available height for book list
-		// Account for border (2), padding (2), and header lines
-		availableHeight := m.height - 8
+	entries := m.getSidebarEntries()
+	if entries == nil {
+		return ""
+	}
 
-		// Build a combined list with section headers
-		type bookEntry struct {
-			isHeader   bool
-			headerText string
-			bookIndex  int
-			book       api.Book
-		}
+	// First pass: calculate heights for ALL entries to correctly handle scrolling
+	type renderedEntry struct {
+		entry sidebarEntry
+		text  string
+	}
+	rendered := make([]renderedEntry, len(entries))
+	selectedIdx := -1
 
-		var entries []bookEntry
-
-		// Old Testament header
-		entries = append(entries, bookEntry{isHeader: true, headerText: "OLD TESTAMENT"})
-
-		// Old Testament books
-		for i, book := range m.books {
-			if book.BookID > 39 {
-				break
-			}
-			entries = append(entries, bookEntry{isHeader: false, bookIndex: i, book: book})
-		}
-
-		// New Testament header (with spacing)
-		entries = append(entries, bookEntry{isHeader: true, headerText: ""}) // blank line
-		entries = append(entries, bookEntry{isHeader: true, headerText: "NEW TESTAMENT"})
-
-		// New Testament books
-		for i, book := range m.books {
-			if book.BookID < 40 {
-				continue
-			}
-			entries = append(entries, bookEntry{isHeader: false, bookIndex: i, book: book})
-		}
-
-		// Find the entry index for the selected book
-		selectedEntryIdx := 0
-		for i, entry := range entries {
-			if !entry.isHeader && entry.bookIndex == m.sidebarSelected {
-				selectedEntryIdx = i
-				break
-			}
-		}
-
-		// Calculate virtual scroll window
-		totalEntries := len(entries)
-		visibleCount := availableHeight
-		if visibleCount < 5 {
-			visibleCount = 5
-		}
-		if visibleCount > totalEntries {
-			visibleCount = totalEntries
-		}
-
-		// Center the selected item in the visible window
-		startIdx := selectedEntryIdx - visibleCount/2
-		if startIdx < 0 {
-			startIdx = 0
-		}
-		endIdx := startIdx + visibleCount
-		if endIdx > totalEntries {
-			endIdx = totalEntries
-			startIdx = endIdx - visibleCount
-			if startIdx < 0 {
-				startIdx = 0
-			}
-		}
-
-		// Show "more above" indicator
-		if startIdx > 0 {
-			sb.WriteString(moreStyle.Render(fmt.Sprintf("... (%d more above)", startIdx)) + "\n")
-		}
-
-		// Render visible entries
-		for i := startIdx; i < endIdx; i++ {
-			entry := entries[i]
-			if entry.isHeader {
-				if entry.headerText == "" {
-					sb.WriteString("\n")
-				} else {
-					sb.WriteString(sectionHeaderStyle.Render(entry.headerText) + "\n")
-				}
+	for i, entry := range entries {
+		var text string
+		var height int
+		if entry.isHeader {
+			if entry.headerText == "" {
+				text = "\n"
+				height = 1
 			} else {
-				if entry.bookIndex == m.sidebarSelected {
-					sb.WriteString(selectedStyle.Render("> "+entry.book.Name) + "\n")
-				} else {
-					sb.WriteString(normalStyle.Render("  "+entry.book.Name) + "\n")
-				}
+				renderedText := sectionHeaderStyle.Render(entry.headerText)
+				text = renderedText + "\n"
+				height = lipgloss.Height(renderedText)
 			}
+		} else {
+			prefix := "  "
+			style := normalStyle
+			if entry.bookIndex == m.sidebarSelected {
+				prefix = "> "
+				style = selectedStyle
+				selectedIdx = i
+			}
+			renderedText := style.Render(prefix + entry.book.Name)
+			text = renderedText + "\n"
+			height = lipgloss.Height(renderedText)
+		}
+		entries[i].height = height
+		rendered[i] = renderedEntry{entry: entries[i], text: text}
+	}
+
+	// Calculate which entries to show
+	startIdx := 0
+	endIdx := len(entries)
+
+	if selectedIdx != -1 {
+		// Attempt to find a window of entries that fits availableLines
+		reservedForMore := 0
+		if selectedIdx > 0 {
+			reservedForMore++
+		}
+		if selectedIdx < len(entries)-1 {
+			reservedForMore++
 		}
 
-		// Show "more below" indicator
-		if endIdx < totalEntries {
-			sb.WriteString(moreStyle.Render(fmt.Sprintf("... (%d more below)", totalEntries-endIdx)) + "\n")
+		targetLines := availableLines - reservedForMore
+		if targetLines < 1 {
+			targetLines = 1
+		}
+
+		currentLines := entries[selectedIdx].height
+		startIdx = selectedIdx
+		endIdx = selectedIdx + 1
+
+		for {
+			expanded := false
+			if startIdx > 0 && currentLines+entries[startIdx-1].height <= targetLines {
+				startIdx--
+				currentLines += entries[startIdx].height
+				expanded = true
+			}
+			if endIdx < len(entries) && currentLines+entries[endIdx].height <= targetLines {
+				currentLines += entries[endIdx].height
+				endIdx++
+				expanded = true
+			}
+			if !expanded || currentLines >= targetLines {
+				break
+			}
 		}
 	}
 
-	sidebar := sidebarStyle.Render(sb.String())
+	var sb strings.Builder
+	if startIdx > 0 {
+		sb.WriteString(moreStyle.Render(fmt.Sprintf("... (%d more above)", startIdx)) + "\n")
+	}
+	for i := startIdx; i < endIdx; i++ {
+		sb.WriteString(rendered[i].text)
+	}
+	if endIdx < len(entries) {
+		sb.WriteString(moreStyle.Render(fmt.Sprintf("... (%d more below)", len(entries)-endIdx)))
+	}
+
+	sidebar := sidebarStyle.Render(strings.TrimSuffix(sb.String(), "\n"))
 
 	// Add shadow effect to the right of the sidebar with gradient
 	shadow1Style := lipgloss.NewStyle().
@@ -1874,6 +3210,330 @@ func (m Model) renderSidebar() string {
 	return result.String()
 }
 
+func (m Model) renderHighlightSettings(header, help, errorMsg string) string {
+	containerStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(m.currentTheme.BorderActive).
+		Padding(1, 2)
+
+	selectedStyle := lipgloss.NewStyle().
+		Foreground(m.currentTheme.Accent).
+		Background(m.currentTheme.Highlight).
+		Bold(true).
+		Padding(0, 1)
+
+	normalStyle := lipgloss.NewStyle().
+		Foreground(m.currentTheme.Primary).
+		Background(m.currentTheme.Background).
+		Padding(0, 1)
+
+	colors := []string{"#FFFF00", "#FF00FF", "#00FFFF", "#00FF00", "#FF0000", "#0000FF", "#FFFFFF", "#FFA500"}
+	colorNames := []string{"Yellow", "Magenta", "Cyan", "Green", "Red", "Blue", "White", "Orange"}
+
+	var content strings.Builder
+	for i, name := range colorNames {
+		prefix := "  "
+		style := normalStyle
+		if i == m.highlightColorSelected {
+			prefix = "> "
+			style = selectedStyle
+		}
+
+		// Show a small color preview box
+		preview := lipgloss.NewStyle().Background(lipgloss.Color(colors[i])).Render("  ")
+		content.WriteString(style.Render(prefix+name) + " " + preview + "\n")
+	}
+
+	listContent := containerStyle.Width(m.width - 4).Render(strings.TrimSuffix(content.String(), "\n"))
+	return fmt.Sprintf("%s\n%s\n%s%s", header, listContent, help, errorMsg)
+}
+
+func (m Model) renderNoteInput(header, help, errorMsg string) string {
+	containerStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(m.currentTheme.BorderActive).
+		Padding(1, 2)
+
+	titleStyle := lipgloss.NewStyle().
+		Foreground(m.currentTheme.Accent).
+		Bold(true)
+
+	var currentWord string
+	for _, v := range m.currentVerses {
+		if v.Verse == m.highlightedVerseStart {
+			words := strings.Split(stripHTMLTags(v.Text), " ")
+			if m.wordIndex >= 0 && m.wordIndex < len(words) {
+				currentWord = words[m.wordIndex]
+			}
+			break
+		}
+	}
+
+	var content strings.Builder
+	content.WriteString(titleStyle.Render("Add Note for word:") + " " + currentWord + "\n\n")
+	
+	content.WriteString(m.noteInput.View())
+	content.WriteString("\n\nPress Enter to save, Esc to cancel")
+
+	listContent := containerStyle.Width(m.width - 4).Render(content.String())
+	return fmt.Sprintf("%s\n%s\n%s%s", header, listContent, help, errorMsg)
+}
+
+func (m Model) getChapterNotes() []settings.Note {
+	var chapterNotes []settings.Note
+	versePKs := make(map[int]int) // PK -> Verse Number
+	for _, v := range m.currentVerses {
+		versePKs[v.PK] = v.Verse
+	}
+
+	for _, note := range m.notes {
+		if note.Translation == m.selectedTranslation {
+			if _, ok := versePKs[note.VersePK]; ok {
+				chapterNotes = append(chapterNotes, note)
+			}
+		}
+	}
+
+	// Sort by verse number then word index
+	sort.Slice(chapterNotes, func(i, j int) bool {
+		v1 := versePKs[chapterNotes[i].VersePK]
+		v2 := versePKs[chapterNotes[j].VersePK]
+		if v1 != v2 {
+			return v1 < v2
+		}
+		return chapterNotes[i].WordIndex < chapterNotes[j].WordIndex
+	})
+
+	return chapterNotes
+}
+
+func (m Model) renderReferenceList(header, help, errorMsg string) string {
+	chapterNotes := m.getChapterNotes()
+	if len(chapterNotes) == 0 || m.noteSidebarSelected >= len(chapterNotes) {
+		return "" // Prevent infinite loop with renderNoteSidebar
+	}
+
+	note := chapterNotes[m.noteSidebarSelected]
+	
+	sidebarWidth := 35
+	contentWidth := sidebarWidth - 4
+	if contentWidth < 10 {
+		contentWidth = 10
+	}
+
+	titleStyle := lipgloss.NewStyle().
+		Foreground(m.currentTheme.Accent).
+		Bold(true).
+		MarginBottom(1)
+
+	selectedStyle := lipgloss.NewStyle().
+		Foreground(m.currentTheme.Accent).
+		Background(m.currentTheme.Highlight).
+		Bold(true).
+		Padding(0, 1).
+		Width(contentWidth)
+
+	normalStyle := lipgloss.NewStyle().
+		Foreground(m.currentTheme.Primary).
+		Padding(0, 1).
+		Width(contentWidth)
+
+	var sb strings.Builder
+	sb.WriteString(titleStyle.Render("SELECT REFERENCE") + "\n\n")
+
+	for i, ref := range note.References {
+		prefix := "  "
+		style := normalStyle
+		if i == m.referenceListSelected {
+			prefix = "> "
+			style = selectedStyle
+		}
+
+		refStr := fmt.Sprintf("%s %d:%d", ref.BookName, ref.Chapter, ref.Verse)
+		sb.WriteString(style.Render(prefix+refStr) + "\n")
+	}
+
+	sb.WriteString("\n\n" + lipgloss.NewStyle().Foreground(m.currentTheme.Muted).Render("j/k: nav | enter: go\nesc: back"))
+	return sb.String()
+}
+
+func (m Model) highlightReferencesInText(text string, baseStyle lipgloss.Style) string {
+	// Robust regex for (Book Chapter:Verse) or (Chapter:Verse)
+	// Matches patterns like (John 3:16), (1 John 1:9), (Song of Solomon 1:1), (3:16), (Gen. 1:1)
+	
+	refStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#32CD32")).Italic(true)
+	
+	matches := refRegex.FindAllStringIndex(text, -1)
+	if matches == nil {
+		return baseStyle.Render(text)
+	}
+	var sb strings.Builder
+	lastIdx := 0
+	for _, match := range matches {
+		if match[0] > lastIdx {
+			sb.WriteString(baseStyle.Render(text[lastIdx:match[0]]))
+		}
+		sb.WriteString(refStyle.Render(text[match[0]:match[1]]))
+		lastIdx = match[1]
+	}
+	if lastIdx < len(text) {
+		sb.WriteString(baseStyle.Render(text[lastIdx:]))
+	}
+	return sb.String()
+}
+
+func (m Model) renderNoteSidebar() string {
+	chapterNotes := m.getChapterNotes()
+	if len(chapterNotes) == 0 && m.mode != modeWordSelect && m.mode != modeNoteInput && m.mode != modeNoteSidebar {
+		return ""
+	}
+	sidebarWidth := 35
+	contentWidth := sidebarWidth - 4
+	if contentWidth < 10 { contentWidth = 10 }
+	titleStyle := lipgloss.NewStyle().Foreground(m.currentTheme.Accent).Bold(true).MarginBottom(1)
+	selectedStyle := lipgloss.NewStyle().UnsetForeground().Background(m.currentTheme.Highlight).Bold(true).Padding(0, 1).Width(contentWidth)
+	normalStyle := lipgloss.NewStyle().UnsetForeground().Padding(0, 1).Width(contentWidth)
+	verseRefStyle := lipgloss.NewStyle().Foreground(m.currentTheme.Accent).Bold(true)
+	noteTextStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF"))
+	refCountStyle := lipgloss.NewStyle().Foreground(m.currentTheme.Warning).Italic(true)
+	var sb strings.Builder
+	if m.mode == modeReferenceList {
+		return m.renderReferenceList("", "", "")
+	}
+	sb.WriteString(titleStyle.Render("CHAPTER NOTES") + "\n\n")
+	if len(chapterNotes) == 0 {
+		sb.WriteString(lipgloss.NewStyle().Foreground(m.currentTheme.Primary).Padding(0, 1).Render("No notes in this chapter."))
+		if m.mode == modeNoteSidebar {
+			sb.WriteString("\n\n" + lipgloss.NewStyle().Foreground(m.currentTheme.Success).Padding(0, 1).Render("Press 'a' to add a note"))
+		}
+	} else {
+		for i, note := range chapterNotes {
+			verseNum := 0
+			for _, v := range m.currentVerses {
+				if v.PK == note.VersePK { verseNum = v.Verse; break }
+			}
+			prefix := "  "
+			style := normalStyle
+			if (m.mode == modeNoteSidebar || m.mode == modeReferenceList) && i == m.noteSidebarSelected {
+				prefix = "> "; style = selectedStyle
+			}
+			refPrefix := fmt.Sprintf("%d:%d | ", m.currentChapter, verseNum)
+			noteText := note.Text
+			if len(noteText) > 150 { noteText = noteText[:147] + "..." }
+			innerContent := lipgloss.NewStyle().Bold(style.GetBold()).Render(prefix) + verseRefStyle.Render(refPrefix) + m.highlightReferencesInText(noteText, noteTextStyle)
+			sb.WriteString(style.Render(innerContent) + "\n")
+			if len(note.References) > 0 {
+				refStr := fmt.Sprintf("    Refs: %d", len(note.References))
+				sb.WriteString(refCountStyle.Render(refStr) + "\n")
+			}
+		}
+	}
+	if m.mode == modeNoteSidebar {
+		sb.WriteString("\n\n" + lipgloss.NewStyle().Foreground(m.currentTheme.Muted).Render("j/k: nav | enter: edit\ng: go to ref\na: add | d: delete\nesc: back"))
+	}
+	return sb.String()
+}
+
+func (m Model) renderLanguageSelect(header, help, errorMsg string) string {
+	containerStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(m.currentTheme.BorderActive).
+		Padding(1, 2)
+
+	selectedStyle := lipgloss.NewStyle().
+		Foreground(m.currentTheme.Accent).
+		Background(m.currentTheme.Highlight).
+		Bold(true).
+		Padding(0, 1)
+
+	normalStyle := lipgloss.NewStyle().
+		Foreground(m.currentTheme.Primary).
+		Background(m.currentTheme.Background).
+		Padding(0, 1)
+
+	currentStyle := lipgloss.NewStyle().
+		Foreground(m.currentTheme.Success).
+		Background(m.currentTheme.Background).
+		Padding(0, 1)
+
+	moreStyle := lipgloss.NewStyle().
+		Foreground(m.currentTheme.Muted).
+		Background(m.currentTheme.Background).
+		Italic(true).
+		Padding(0, 1)
+
+	var content strings.Builder
+
+	if m.languages != nil {
+		// Calculate available lines: height - header - help - error - borders/padding
+		headerHeight := lipgloss.Height(header)
+		helpHeight := lipgloss.Height(help)
+		errorHeight := 0
+		if errorMsg != "" {
+			errorHeight = lipgloss.Height(errorMsg)
+		}
+		availableLines := m.height - headerHeight - helpHeight - errorHeight - 6
+		if availableLines < 1 {
+			availableLines = 1
+		}
+
+		total := len(m.languages)
+		visibleCount := availableLines
+		if visibleCount > total {
+			visibleCount = total
+		}
+
+		startIdx := m.languageSelected - (visibleCount / 2)
+		if startIdx < 0 {
+			startIdx = 0
+		}
+		endIdx := startIdx + visibleCount
+		if endIdx > total {
+			endIdx = total
+			startIdx = endIdx - visibleCount
+			if startIdx < 0 {
+				startIdx = 0
+			}
+		}
+
+		if startIdx > 0 {
+			content.WriteString(moreStyle.Render(fmt.Sprintf("... (%d more above)", startIdx)) + "\n")
+		}
+
+		for i := startIdx; i < endIdx; i++ {
+			lang := m.languages[i]
+			prefix := "  "
+			style := normalStyle
+			suffix := ""
+
+			isCurrent := lang == m.selectedLanguage
+
+			if i == m.languageSelected {
+				prefix = "> "
+				style = selectedStyle
+			} else if isCurrent {
+				style = currentStyle
+			}
+
+			if isCurrent && i != m.languageSelected {
+				suffix = " [Current]"
+			}
+
+			style = style.Width(m.width - 10)
+			content.WriteString(style.Render(prefix+lang+suffix) + "\n")
+		}
+
+		if endIdx < total {
+			content.WriteString(moreStyle.Render(fmt.Sprintf("... (%d more below)", total-endIdx)) + "\n")
+		}
+	} else {
+		content.WriteString(normalStyle.Render("  Loading languages..."))
+	}
+
+	listContent := containerStyle.Width(m.width - 4).Render(strings.TrimSuffix(content.String(), "\n"))
+	return fmt.Sprintf("%s\n%s\n%s%s", header, listContent, help, errorMsg)
+}
+
 func (m Model) renderTranslationSelect(header, help, errorMsg string) string {
 	containerStyle := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
@@ -1888,16 +3548,61 @@ func (m Model) renderTranslationSelect(header, help, errorMsg string) string {
 
 	normalStyle := lipgloss.NewStyle().
 		Foreground(m.currentTheme.Primary).
+		Background(m.currentTheme.Background).
 		Padding(0, 1)
 
 	currentStyle := lipgloss.NewStyle().
 		Foreground(m.currentTheme.Success).
+		Background(m.currentTheme.Background).
+		Padding(0, 1)
+
+	moreStyle := lipgloss.NewStyle().
+		Foreground(m.currentTheme.Muted).
+		Background(m.currentTheme.Background).
+		Italic(true).
 		Padding(0, 1)
 
 	var content strings.Builder
 
 	if m.translations != nil {
-		for i, trans := range m.translations {
+		// Calculate available height: terminal height - header - help - error - borders - padding
+		headerHeight := lipgloss.Height(header)
+		helpHeight := lipgloss.Height(help)
+		errorHeight := 0
+		if errorMsg != "" {
+			errorHeight = lipgloss.Height(errorMsg)
+		}
+		availableLines := m.height - headerHeight - helpHeight - errorHeight - 6
+		if availableLines < 1 {
+			availableLines = 1
+		}
+
+		total := len(m.translations)
+		visibleCount := availableLines
+		if visibleCount > total {
+			visibleCount = total
+		}
+
+		// Calculate virtual scroll window
+		startIdx := m.translationSelected - (visibleCount / 2)
+		if startIdx < 0 {
+			startIdx = 0
+		}
+		endIdx := startIdx + visibleCount
+		if endIdx > total {
+			endIdx = total
+			startIdx = endIdx - visibleCount
+			if startIdx < 0 {
+				startIdx = 0
+			}
+		}
+
+		if startIdx > 0 {
+			content.WriteString(moreStyle.Render(fmt.Sprintf("... (%d more above)", startIdx)) + "\n")
+		}
+
+		for i := startIdx; i < endIdx; i++ {
+			trans := m.translations[i]
 			prefix := "  "
 			style := normalStyle
 			suffix := ""
@@ -1913,18 +3618,23 @@ func (m Model) renderTranslationSelect(header, help, errorMsg string) string {
 			}
 
 			name := fmt.Sprintf("%-6s - %s", trans.ShortName, trans.FullName)
-
 			if isCurrent && i != m.translationSelected {
 				suffix = " [Current]"
 			}
 
+			// Ensure width for background coloring
+			style = style.Width(m.width - 10)
 			content.WriteString(style.Render(prefix+name+suffix) + "\n")
+		}
+
+		if endIdx < total {
+			content.WriteString(moreStyle.Render(fmt.Sprintf("... (%d more below)", total-endIdx)) + "\n")
 		}
 	} else {
 		content.WriteString(normalStyle.Render("  Loading translations..."))
 	}
 
-	listContent := containerStyle.Render(content.String())
+	listContent := containerStyle.Width(m.width - 4).Render(strings.TrimSuffix(content.String(), "\n"))
 	return fmt.Sprintf("%s\n%s\n%s%s", header, listContent, help, errorMsg)
 }
 
@@ -1942,20 +3652,67 @@ func (m Model) renderCacheManager(header, help, errorMsg string) string {
 
 	normalStyle := lipgloss.NewStyle().
 		Foreground(m.currentTheme.Primary).
+		Background(m.currentTheme.Background).
 		Padding(0, 1)
 
 	cachedStyle := lipgloss.NewStyle().
 		Foreground(m.currentTheme.Success).
+		Background(m.currentTheme.Background).
 		Padding(0, 1)
 
 	downloadingStyle := lipgloss.NewStyle().
 		Foreground(m.currentTheme.Warning).
+		Background(m.currentTheme.Background).
+		Padding(0, 1)
+
+	moreStyle := lipgloss.NewStyle().
+		Foreground(m.currentTheme.Muted).
+		Background(m.currentTheme.Background).
+		Italic(true).
 		Padding(0, 1)
 
 	var content strings.Builder
 
 	if m.translations != nil {
-		for i, trans := range m.translations {
+		// Calculate available height: terminal height - header - help - error - borders - padding
+		headerHeight := lipgloss.Height(header)
+		helpHeight := lipgloss.Height(help)
+		errorHeight := 0
+		if errorMsg != "" {
+			errorHeight = lipgloss.Height(errorMsg)
+		}
+		// -8 for borders/padding/spacing and extra for cache size line
+		availableLines := m.height - headerHeight - helpHeight - errorHeight - 8
+		if availableLines < 1 {
+			availableLines = 1
+		}
+
+		total := len(m.translations)
+		visibleCount := availableLines
+		if visibleCount > total {
+			visibleCount = total
+		}
+
+		// Calculate virtual scroll window
+		startIdx := m.cacheSelected - (visibleCount / 2)
+		if startIdx < 0 {
+			startIdx = 0
+		}
+		endIdx := startIdx + visibleCount
+		if endIdx > total {
+			endIdx = total
+			startIdx = endIdx - visibleCount
+			if startIdx < 0 {
+				startIdx = 0
+			}
+		}
+
+		if startIdx > 0 {
+			content.WriteString(moreStyle.Render(fmt.Sprintf("... (%d more above)", startIdx)) + "\n")
+		}
+
+		for i := startIdx; i < endIdx; i++ {
+			trans := m.translations[i]
 			prefix := "  "
 			style := normalStyle
 			suffix := ""
@@ -1975,20 +3732,23 @@ func (m Model) renderCacheManager(header, help, errorMsg string) string {
 			}
 
 			name := fmt.Sprintf("%-6s - %s", trans.ShortName, trans.FullName)
-
 			if isDownloading {
 				suffix = " [Downloading...]"
 				style = downloadingStyle
 			} else if isCached {
 				suffix = " [✓]"
-				if i == m.cacheSelected {
-					style = selectedStyle
-				} else {
+				if i != m.cacheSelected {
 					style = cachedStyle
 				}
 			}
 
+			// Ensure width for background coloring
+			style = style.Width(m.width - 10)
 			content.WriteString(style.Render(prefix+name+suffix) + "\n")
+		}
+
+		if endIdx < total {
+			content.WriteString(moreStyle.Render(fmt.Sprintf("... (%d more below)", total-endIdx)) + "\n")
 		}
 	} else {
 		content.WriteString(normalStyle.Render("  Loading translations..."))
@@ -1998,12 +3758,12 @@ func (m Model) renderCacheManager(header, help, errorMsg string) string {
 	if m.cache != nil {
 		size, err := m.cache.GetCacheSize()
 		if err == nil && size > 0 {
-			sizeStr := fmt.Sprintf("\n\nCache Size: %.2f MB", float64(size)/(1024*1024))
+			sizeStr := fmt.Sprintf("\nCache Size: %.2f MB", float64(size)/(1024*1024))
 			content.WriteString("\n" + normalStyle.Render(sizeStr))
 		}
 	}
 
-	listContent := containerStyle.Render(content.String())
+	listContent := containerStyle.Width(m.width - 4).Render(strings.TrimSuffix(content.String(), "\n"))
 	return fmt.Sprintf("%s\n%s\n%s%s", header, listContent, help, errorMsg)
 }
 
@@ -2103,17 +3863,22 @@ func (m Model) formatChapter(verses []api.Verse, bookName string, chapter int, w
 		text := stripHTMLTags(v.Text)
 		verseNumStr := fmt.Sprintf("%d", v.Verse)
 
-		// Check if this verse is in the highlighted range
-		isHighlighted := highlightedVerseStart > 0 && v.Verse >= highlightedVerseStart && v.Verse <= highlightedVerseEnd
+		// Check if this verse is in the search-highlighted range (bordered)
+		isSearchHighlighted := highlightedVerseStart > 0 && v.Verse >= highlightedVerseStart && v.Verse <= highlightedVerseEnd
 
-		// Check if next verse is also highlighted
-		nextIsHighlighted := false
+		// Check if next verse is also search-highlighted
+		nextIsSearchHighlighted := false
 		if i+1 < len(verses) {
 			nextVerse := verses[i+1]
-			nextIsHighlighted = highlightedVerseStart > 0 && nextVerse.Verse >= highlightedVerseStart && nextVerse.Verse <= highlightedVerseEnd
+			nextIsSearchHighlighted = highlightedVerseStart > 0 && nextVerse.Verse >= highlightedVerseStart && nextVerse.Verse <= highlightedVerseEnd
 		}
 
-		if isHighlighted {
+		// Apply persistent highlights and cursor
+		// A verse is focused if it's the start of the current viewport focus and we are in an interactive mode
+		isFocusedVerse := v.Verse == m.highlightedVerseStart && (m.mode == modeVerseHighlight || m.mode == modeWordSelect)
+		styledText := m.applyHighlightsToText(v.PK, text, isFocusedVerse)
+
+		if isSearchHighlighted {
 			if !inHighlightedRange {
 				// Start of highlighted range
 				inHighlightedRange = true
@@ -2125,18 +3890,18 @@ func (m Model) formatChapter(verses []api.Verse, bookName string, chapter int, w
 			// Calculate indent for wrapped lines (verse number width + 2 spaces)
 			indent := 6
 			// Account for border padding (2 chars on each side)
-			wrappedText := wrapTextWithIndent(text, textWidth-4, indent)
+			wrappedText := wrapTextWithIndent(styledText, textWidth-4, indent)
 			// Apply color with width set to prevent terminal wrapping
 			verseText := highlightedTextStyle.Width(textWidth - 4).Render(wrappedText)
 
 			highlightedContent.WriteString(fmt.Sprintf("%s  %s", verseNum, verseText))
 
 			// If next verse is also highlighted, add spacing within the border
-			if nextIsHighlighted {
+			if nextIsSearchHighlighted {
 				highlightedContent.WriteString("\n\n")
 			} else {
 				// End of highlighted range - render the border
-				borderedVerse := highlightedContainerStyle.Render(highlightedContent.String())
+				borderedVerse := highlightedContainerStyle.Width(width - 2).Render(highlightedContent.String())
 				sb.WriteString(borderedVerse + "\n\n")
 				inHighlightedRange = false
 			}
@@ -2145,7 +3910,7 @@ func (m Model) formatChapter(verses []api.Verse, bookName string, chapter int, w
 
 			// Calculate indent for wrapped lines (verse number width + 2 spaces)
 			indent := 6
-			wrappedText := wrapTextWithIndent(text, textWidth, indent)
+			wrappedText := wrapTextWithIndent(styledText, textWidth, indent)
 			// Apply color with width set to prevent terminal wrapping
 			verseText := textStyle.Width(textWidth).Render(wrappedText)
 
@@ -2153,7 +3918,117 @@ func (m Model) formatChapter(verses []api.Verse, bookName string, chapter int, w
 		}
 	}
 
+	// Final check for an open highlighted range at the end of the chapter
+	if inHighlightedRange {
+		borderedVerse := highlightedContainerStyle.Width(width - 2).Render(highlightedContent.String())
+		sb.WriteString(borderedVerse + "\n\n")
+	}
+
 	return sb.String()
+}
+
+func (m Model) applyHighlightsToText(versePK int, text string, isFocused bool) string {
+	runes := []rune(text)
+	if len(runes) == 0 {
+		return text
+	}
+
+	// 1. First pass: Map each original character to its persistent highlight style
+	type charState struct {
+		r     rune
+		style lipgloss.Style
+	}
+	states := make([]charState, len(runes))
+	for i, r := range runes {
+		states[i] = charState{r: r, style: lipgloss.NewStyle()}
+	}
+
+	for _, h := range m.highlights {
+		if h.VersePK == versePK {
+			hStyle := lipgloss.NewStyle().Background(lipgloss.Color(h.Color)).Foreground(lipgloss.Color("#000000"))
+			for i := h.Start; i < h.End && i < len(states); i++ {
+				states[i].style = hStyle
+			}
+		}
+	}
+
+	// 2. Active character highlighting (real-time feedback)
+	if isFocused && m.mode == modeVerseHighlight {
+		if m.selectionStart != -1 {
+			start, end := m.selectionStart, m.verseCursorPos
+			if start > end { start, end = end, start }
+			selStyle := lipgloss.NewStyle().Background(lipgloss.Color(m.selectedHighlightColor)).Foreground(lipgloss.Color("#000000")).Underline(true)
+			for i := start; i <= end && i < len(states); i++ {
+				states[i].style = selStyle
+			}
+		}
+		// Cursor (highest priority)
+		cursorStyle := lipgloss.NewStyle().Background(lipgloss.Color("#FFFFFF")).Foreground(lipgloss.Color("#000000")).Bold(true)
+		if m.verseCursorPos >= 0 && m.verseCursorPos < len(states) {
+			states[m.verseCursorPos].style = cursorStyle
+		}
+	}
+
+	// 3. Group characters into words to handle symbol injection and word selection
+	// We split by space but keep track of the original character states
+	type wordRange struct {
+		start, end int // indices into states slice
+	}
+	var wordRanges []wordRange
+	currentStart := 0
+	for i := 0; i <= len(runes); i++ {
+		if i == len(runes) || runes[i] == ' ' {
+			if i > currentStart {
+				wordRanges = append(wordRanges, wordRange{currentStart, i})
+			}
+			currentStart = i + 1
+		}
+	}
+
+	// Create map of notes for this verse
+	verseNotes := make(map[int]settings.Note)
+	for _, note := range m.notes {
+		if note.VersePK == versePK && note.Translation == m.selectedTranslation {
+			verseNotes[note.WordIndex] = note
+		}
+	}
+
+	var finalResult strings.Builder
+	for i, wr := range wordRanges {
+		if i > 0 { finalResult.WriteString(" ") }
+
+		// Build the word text with its character styles
+		var wordContent strings.Builder
+		for j := wr.start; j < wr.end; j++ {
+			wordContent.WriteString(states[j].style.Render(string(states[j].r)))
+		}
+		wordStr := wordContent.String()
+
+		// Apply word selection style (overlay)
+		if isFocused && m.mode == modeWordSelect && i == m.wordIndex {
+			// Use Inverse or a very distinct background for selection
+			wordStr = lipgloss.NewStyle().
+				Background(m.currentTheme.Accent).
+				Foreground(lipgloss.Color("#000000")).
+				Bold(true).
+				Render(stripANSI(wordStr)) // Strip internal styles to prevent artifacts during selection
+		}
+
+		finalResult.WriteString(wordStr)
+
+		// Inject note symbol AFTER the word
+		if note, ok := verseNotes[i]; ok {
+			symbolStyle := lipgloss.NewStyle().Foreground(m.currentTheme.Warning).Bold(true)
+			finalResult.WriteString(symbolStyle.Render("[" + note.Symbol + "]"))
+		}
+	}
+
+	return finalResult.String()
+}
+
+// Helper to strip ANSI codes when we need raw text for a specific overlay style
+func stripANSI(str string) string {
+	return ansiRegex.ReplaceAllString(str, "")
 }
 
 func wrapText(text string, width int) string {
@@ -2165,12 +4040,13 @@ func wrapText(text string, width int) string {
 	var currentLine strings.Builder
 	currentLength := 0
 
-	words := strings.Fields(text)
+	words := strings.Split(text, " ")
 	for i, word := range words {
-		wordLen := len(word)
+		// Use lipgloss.Width to get visual width excluding ANSI codes
+		wordWidth := lipgloss.Width(word)
 
 		// If adding this word would exceed width, start a new line
-		if currentLength > 0 && currentLength+1+wordLen > width {
+		if currentLength > 0 && currentLength+1+wordWidth > width {
 			result.WriteString(currentLine.String())
 			result.WriteString("\n")
 			currentLine.Reset()
@@ -2184,7 +4060,7 @@ func wrapText(text string, width int) string {
 		}
 
 		currentLine.WriteString(word)
-		currentLength += wordLen
+		currentLength += wordWidth
 
 		// If this is the last word, write it out
 		if i == len(words)-1 {
@@ -2205,12 +4081,12 @@ func wrapTextWithIndent(text string, width int, indent int) string {
 	currentLength := 0
 	isFirstLine := true
 
-	words := strings.Fields(text)
+	words := strings.Split(text, " ")
 	for i, word := range words {
-		wordLen := len(word)
+		wordWidth := lipgloss.Width(word)
 
 		// If adding this word would exceed width, start a new line
-		if currentLength > 0 && currentLength+1+wordLen > width {
+		if currentLength > 0 && currentLength+1+wordWidth > width {
 			result.WriteString(currentLine.String())
 			result.WriteString("\n")
 			currentLine.Reset()
@@ -2231,7 +4107,7 @@ func wrapTextWithIndent(text string, width int, indent int) string {
 		}
 
 		currentLine.WriteString(word)
-		currentLength += wordLen
+		currentLength += wordWidth
 
 		// If this is the last word, write it out
 		if i == len(words)-1 {
@@ -2321,8 +4197,7 @@ func (m Model) formatParallelVerses(versesMap map[string][]api.Verse, translatio
 
 func stripHTMLTags(s string) string {
 	// First replace HTML tags with spaces to preserve word boundaries
-	re := regexp.MustCompile(`<[^>]*>`)
-	s = re.ReplaceAllString(s, " ")
+	s = htmlTagRegex.ReplaceAllString(s, " ")
 
 	// Decode common HTML entities
 	s = strings.ReplaceAll(s, "&nbsp;", " ")
@@ -2646,6 +4521,7 @@ func (m Model) renderAbout(header, help, errorMsg string) string {
 		{"T", "Select theme"},
 		{"d", "Download translations"},
 		{"y", "Yank/copy verse"},
+		{"N", "Chapter notes"},
 		{"n / PgDn", "Next chapter"},
 		{"p / PgUp", "Previous chapter"},
 		{"?", "Show this about page"},
@@ -2701,7 +4577,14 @@ func (m Model) renderWordSearch(header, help, errorMsg string) string {
 			m.wordSearchTotal, m.wordSearchQuery, len(m.wordSearchResults)))
 
 		// Calculate visible window for virtual scrolling
-		visibleItems := m.height - 10
+		headerHeight := lipgloss.Height(header)
+		helpHeight := lipgloss.Height(help)
+		errorHeight := 0
+		if errorMsg != "" {
+			errorHeight = lipgloss.Height(errorMsg)
+		}
+		// Calculate available lines: height - header - help - error - borders/padding/count line
+		visibleItems := m.height - headerHeight - helpHeight - errorHeight - 10
 		if visibleItems < 5 {
 			visibleItems = 5
 		}

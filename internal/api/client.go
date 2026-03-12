@@ -73,7 +73,7 @@ type SearchResponse struct {
 	Results      []Verse `json:"results"`
 }
 
-func (c *Client) GetTranslations() ([]Translation, error) {
+func (c *Client) GetLanguageGroups() ([]LanguageGroup, error) {
 	url := fmt.Sprintf("%s/static/bolls/app/views/languages.json", baseURL)
 	resp, err := c.httpClient.Get(url)
 	if err != nil {
@@ -90,16 +90,23 @@ func (c *Client) GetTranslations() ([]Translation, error) {
 		return nil, err
 	}
 
-	// Filter for English translations only
-	var englishTranslations []Translation
+	return languageGroups, nil
+}
+
+func (c *Client) GetTranslations(language string) ([]Translation, error) {
+	languageGroups, err := c.GetLanguageGroups()
+	if err != nil {
+		return nil, err
+	}
+
+	// Filter for requested language
 	for _, group := range languageGroups {
-		if group.Language == "English" {
-			englishTranslations = group.Translations
-			break
+		if group.Language == language {
+			return group.Translations, nil
 		}
 	}
 
-	return englishTranslations, nil
+	return nil, fmt.Errorf("language not found: %s", language)
 }
 
 func (c *Client) GetBooks(translation string) ([]Book, error) {
