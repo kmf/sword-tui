@@ -8,7 +8,7 @@ import (
 	"sword-tui/internal/ui"
 	"sword-tui/internal/version"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 )
 
 func main() {
@@ -32,11 +32,7 @@ func main() {
 	model := ui.NewModel()
 	model.SetCache(cacheManager)
 
-	p := tea.NewProgram(
-		model,
-		tea.WithAltScreen(),
-		tea.WithMouseCellMotion(),
-	)
+	p := tea.NewProgram(model)
 
 	if _, err := p.Run(); err != nil {
 		fmt.Printf("Error running program: %v\n", err)

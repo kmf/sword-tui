@@ -10,12 +10,14 @@ import (
 	"sword-tui/internal/settings"
 	"sword-tui/internal/theme"
 	"sword-tui/internal/version"
+	"time"
 
 	"github.com/atotto/clipboard"
-	"github.com/charmbracelet/bubbles/textinput"
-	"github.com/charmbracelet/bubbles/viewport"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/bubbles/v2/progress"
+	"charm.land/bubbles/v2/textinput"
+	"charm.land/bubbles/v2/viewport"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 )
 
 type viewMode int
@@ -30,6 +32,13 @@ const (
 	modeThemeSelect
 	modeAbout
 	modeWordSearch
+)
+
+type focusPane int
+
+const (
+	paneBooks focusPane = iota
+	paneContent
 )
 
 type Model struct {
@@ -84,6 +93,37 @@ type Model struct {
 	wordSearchTotal    int
 	wordSearchSelected int
 	wordSearchLoading  bool
+	// Pane focus (book list vs content)
+	focus focusPane
+	// themePinned is true when the user has an explicit theme stored in
+	// settings (or has picked one this session). When false, an incoming
+	// BackgroundColorMsg from the terminal may swap us to a light or
+	// dark default.
+	themePinned bool
+	// topVisibleVerse mirrors the verse number currently at the top of
+	// the viewport. The right pane title surfaces it as a sticky scroll
+	// indicator so the reader always knows where they are.
+	topVisibleVerse int
+	// Last known mouse position. Updated on every MouseClickMsg /
+	// MouseMotionMsg / MouseWheelMsg. The render functions read these
+	// to surface hover state (book row hover in the left pane, verse
+	// number hover in the right pane title).
+	mouseX, mouseY int
+	// dragAnchorVerse holds the verse number where the user pressed
+	// the left mouse button in the reader. While the button is held
+	// and the mouse moves, the highlighted range is extended from this
+	// anchor to whichever verse the cursor is now over. 0 means no
+	// drag in progress.
+	dragAnchorVerse int
+	// comparisonPickerColumn is the column index in comparisonTranslations
+	// whose translation is currently being swapped via the translation
+	// picker. -1 means the picker is not scoped to a column (i.e. the
+	// normal "set the active translation" flow).
+	comparisonPickerColumn int
+	// Translation download progress in [0, 1]. Polled from the cache
+	// every ~120ms while a download is running.
+	downloadProgress float64
+	progressBar      progress.Model
 }
 
 type CacheInterface interface {
@@ -91,6 +131,11 @@ type CacheInterface interface {
 	GetChapter(translation string, book, chapter int) ([]api.Verse, error)
 	GetVerse(translation string, book, chapter, verse int) (*api.Verse, error)
 	DownloadTranslation(translation string) error
+	// DownloadProgress reports the byte-level progress of the currently
+	// running download as a value in [0, 1] and the translation
+	// short-name being downloaded ("" if idle). Safe to call from any
+	// goroutine.
+	DownloadProgress() (float64, string)
 	ListCached() ([]string, error)
 	GetCacheSize() (int64, error)
 	RemoveTranslation(translation string) error
@@ -117,6 +162,16 @@ type searchResultsLoadedMsg struct {
 	query   string
 }
 
+// downloadTickMsg fires roughly every 120ms while a translation download
+// is running so the UI can poll the cache for byte-level progress.
+type downloadTickMsg struct{}
+
+func downloadTick() tea.Cmd {
+	return tea.Tick(120*time.Millisecond, func(time.Time) tea.Msg {
+		return downloadTickMsg{}
+	})
+}
+
 func (e errMsg) Error() string { return e.err.Error() }
 
 func NewModel() Model {
@@ -124,17 +179,17 @@ func NewModel() Model {
 	ti.Placeholder = "Enter verse reference (e.g., 1 1:1 or Gen 1:1)"
 	ti.Focus()
 	ti.CharLimit = 50
-	ti.Width = 50
+	ti.SetWidth(50)
 
 	millerFilter := textinput.New()
 	millerFilter.Placeholder = "Type to filter..."
 	millerFilter.CharLimit = 50
-	millerFilter.Width = 25
+	millerFilter.SetWidth(25)
 
 	wordSearch := textinput.New()
 	wordSearch.Placeholder = "Search the Bible..."
 	wordSearch.CharLimit = 100
-	wordSearch.Width = 50
+	wordSearch.SetWidth(50)
 
 	// --- Load persisted settings (if any) ---
 	cfg, err := settings.Load()
@@ -178,6 +233,12 @@ func NewModel() Model {
 		comparisonTranslations: []string{"NLT", "KJV", "WEB"},
 		currentTheme:           currentTheme,
 		themeSelected:          0,
+		focus:                  paneContent,
+		// If the user had a theme stored in settings, treat it as pinned
+		// so auto-detect from the terminal background doesn't override it.
+		themePinned:            err == nil && cfg.CurrentTheme != "",
+		progressBar:            progress.New(progress.WithDefaultBlend(), progress.WithoutPercentage()),
+		comparisonPickerColumn: -1,
 	}
 }
 
@@ -194,6 +255,9 @@ func (m Model) Init() tea.Cmd {
 		loadTranslations(m.client),
 		loadBooks(m.client, m.selectedTranslation),
 		loadChapter(m.client, m.selectedTranslation, m.currentBook, m.currentChapter),
+		// Ask the terminal for its background color so we can auto-pick
+		// a light or dark default theme if the user hasn't pinned one.
+		tea.RequestBackgroundColor,
 	)
 }
 
@@ -296,9 +360,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		case "[":
 			if m.mode == modeReader {
-				m.showSidebar = !m.showSidebar
-				if m.showSidebar && m.books != nil {
-					// Find the index of the current book in the books array
+				m.focus = paneBooks
+				if m.books != nil {
 					for i, book := range m.books {
 						if book.BookID == m.currentBook {
 							m.sidebarSelected = i
@@ -308,8 +371,39 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 			}
+		case "]":
+			if m.mode == modeReader {
+				m.focus = paneContent
+				return m, nil
+			}
+		case "tab":
+			if m.mode == modeReader {
+				if m.focus == paneBooks {
+					m.focus = paneContent
+				} else {
+					m.focus = paneBooks
+					if m.books != nil && m.sidebarSelected == 0 {
+						for i, book := range m.books {
+							if book.BookID == m.currentBook {
+								m.sidebarSelected = i
+								break
+							}
+						}
+					}
+				}
+				return m, nil
+			}
+		case "shift+tab":
+			if m.mode == modeReader {
+				if m.focus == paneBooks {
+					m.focus = paneContent
+				} else {
+					m.focus = paneBooks
+				}
+				return m, nil
+			}
 		case "v":
-			if m.mode == modeReader && !m.showSidebar {
+			if m.mode == modeReader {
 				m.showMillerColumns = !m.showMillerColumns
 				if m.showMillerColumns && m.books != nil {
 					// Initialize Miller columns with current position
@@ -343,7 +437,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			} else if m.mode == modeReader {
 				// Close sidebar if open when entering search mode
-				m.showSidebar = false
+				m.focus = paneContent
 				m.mode = modeSearch
 				m.textInput.Focus()
 				return m, nil
@@ -380,7 +474,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				}
 				return m, nil
-			} else if m.showSidebar && m.sidebarSelected > 0 {
+			} else if m.focus == paneBooks && m.sidebarSelected > 0 {
 				m.sidebarSelected--
 				return m, nil
 			} else if m.mode == modeReader && m.currentVerses != nil {
@@ -395,7 +489,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if currentIdx > 0 {
 					m.highlightedVerseStart = m.currentVerses[currentIdx-1].Verse
 					m.highlightedVerseEnd = m.highlightedVerseStart
-					m.content = m.formatChapter(m.currentVerses, m.currentBookName, m.currentChapter, m.width, m.highlightedVerseStart, m.highlightedVerseEnd)
+					m.content = m.formatChapter(m.currentVerses, m.currentBookName, m.currentChapter, m.viewport.Width(), m.highlightedVerseStart, m.highlightedVerseEnd)
 					m.viewport.SetContent(m.content)
 					m.scrollToHighlightedVerse()
 				}
@@ -448,7 +542,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				}
 				return m, nil
-			} else if m.showSidebar && m.books != nil && m.sidebarSelected < len(m.books)-1 {
+			} else if m.focus == paneBooks && m.books != nil && m.sidebarSelected < len(m.books)-1 {
 				m.sidebarSelected++
 				return m, nil
 			} else if m.mode == modeReader && m.currentVerses != nil {
@@ -463,7 +557,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if currentIdx >= 0 && currentIdx < len(m.currentVerses)-1 {
 					m.highlightedVerseStart = m.currentVerses[currentIdx+1].Verse
 					m.highlightedVerseEnd = m.highlightedVerseStart
-					m.content = m.formatChapter(m.currentVerses, m.currentBookName, m.currentChapter, m.width, m.highlightedVerseStart, m.highlightedVerseEnd)
+					m.content = m.formatChapter(m.currentVerses, m.currentBookName, m.currentChapter, m.viewport.Width(), m.highlightedVerseStart, m.highlightedVerseEnd)
 					m.viewport.SetContent(m.content)
 					m.scrollToHighlightedVerse()
 				}
@@ -497,7 +591,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case "c":
-			if m.mode == modeReader && !m.showSidebar {
+			if m.mode == modeReader {
 				m.mode = modeComparison
 				verses := []int{}
 				for i := 1; i <= 31; i++ {
@@ -516,7 +610,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case "t":
-			if m.mode == modeReader && !m.showSidebar {
+			if m.mode == modeReader {
 				m.mode = modeTranslationSelect
 				m.translationSelected = 0
 				// Find current translation in list
@@ -531,7 +625,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case "T":
-			if m.mode == modeReader && !m.showSidebar {
+			if m.mode == modeReader {
 				m.mode = modeThemeSelect
 				m.themeSelected = 0
 				// Find current theme in list
@@ -545,7 +639,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case "d":
-			if m.mode == modeReader && !m.showSidebar {
+			if m.mode == modeReader {
 				m.mode = modeCacheManager
 				m.cacheSelected = 0
 				if m.cache != nil {
@@ -554,12 +648,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case "?":
-			if m.mode == modeReader && !m.showSidebar {
+			if m.mode == modeReader {
 				m.mode = modeAbout
 				return m, nil
 			}
 		case "s":
-			if m.mode == modeReader && !m.showSidebar {
+			if m.mode == modeReader {
 				m.mode = modeWordSearch
 				m.wordSearchInput.SetValue("")
 				m.wordSearchInput.Focus()
@@ -648,8 +742,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "enter":
 			if m.mode == modeTranslationSelect && m.translations != nil && m.translationSelected < len(m.translations) {
-				// Select translation and reload chapter
-				m.selectedTranslation = m.translations[m.translationSelected].ShortName
+				newTrans := m.translations[m.translationSelected].ShortName
+				// Picker was opened from a comparison column header:
+				// swap that column instead of changing the main reader.
+				if m.comparisonPickerColumn >= 0 && m.comparisonPickerColumn < len(m.comparisonTranslations) {
+					m.comparisonTranslations[m.comparisonPickerColumn] = newTrans
+					m.comparisonPickerColumn = -1
+					m.mode = modeComparison
+					m.loading = true
+					return m, loadParallelVerses(m.client, m.comparisonTranslations, m.currentBook, m.currentChapter, m.comparisonVerseList())
+				}
+				m.selectedTranslation = newTrans
 				m.mode = modeReader
 				m.loading = true
 				return m, tea.Batch(
@@ -660,6 +763,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// Select theme and update all colors
 				themes := theme.AllThemes()
 				m.currentTheme = themes[m.themeSelected]
+				m.themePinned = true
 				m.mode = modeReader
 				return m, nil
 			} else if m.mode == modeCacheManager && m.translations != nil && m.cacheSelected < len(m.translations) {
@@ -667,7 +771,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				translation := m.translations[m.cacheSelected].ShortName
 				if m.cache != nil && !m.cache.IsCached(translation) {
 					m.downloadingTranslation = translation
-					return m, downloadTranslation(m.cache, translation)
+					m.downloadProgress = 0
+					return m, tea.Batch(downloadTranslation(m.cache, translation), downloadTick())
 				}
 				return m, nil
 			} else if m.showMillerColumns && m.millerFilterMode {
@@ -694,13 +799,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					// Scroll viewport to the selected verse
 					return m, loadChapter(m.client, m.selectedTranslation, m.currentBook, m.currentChapter)
 				}
-			} else if m.showSidebar && m.books != nil {
+			} else if m.focus == paneBooks && m.books != nil {
 				// Select book from sidebar
 				if m.sidebarSelected < len(m.books) {
 					m.currentBook = m.books[m.sidebarSelected].BookID
 					m.currentBookName = m.books[m.sidebarSelected].Name
 					m.currentChapter = 1
-					m.showSidebar = false
+					m.focus = paneContent
 					m.loading = true
 					m.highlightedVerseStart = 0
 					m.highlightedVerseEnd = 0
@@ -730,9 +835,32 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			} else if m.mode == modeWordSearch {
 				if m.wordSearchResults == nil && !m.wordSearchLoading {
-					// Submit search query
 					query := m.wordSearchInput.Value()
 					if query != "" {
+						// If the query contains digits AND parses as a verse
+						// reference (e.g. "rom8", "rom 8:8", "john 3:16"),
+						// jump there instead of doing a full-text search.
+						// Plain words like "love" or "rom" fall through to
+						// the full-text path.
+						if strings.ContainsAny(query, "0123456789") {
+							if book, chapter, vs, ve, refErr := parseReference(query, m.books); refErr == nil && book > 0 {
+								m.currentBook = book
+								m.currentChapter = chapter
+								m.highlightedVerseStart = vs
+								m.highlightedVerseEnd = ve
+								for _, b := range m.books {
+									if b.BookID == book {
+										m.currentBookName = b.Name
+										break
+									}
+								}
+								m.mode = modeReader
+								m.loading = true
+								m.wordSearchInput.SetValue("")
+								m.wordSearchInput.Blur()
+								return m, loadChapter(m.client, m.selectedTranslation, m.currentBook, m.currentChapter)
+							}
+						}
 						m.wordSearchLoading = true
 						m.wordSearchInput.Blur()
 						return m, loadSearchResults(m.client, m.selectedTranslation, query)
@@ -798,103 +926,245 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.showMillerColumns = false
 				return m, nil
 			}
-			if m.showSidebar {
-				m.showSidebar = false
-				return m, nil
-			}
-			if m.mode == modeSearch || m.mode == modeTranslationSelect || m.mode == modeThemeSelect || m.mode == modeAbout || m.mode == modeComparison || m.mode == modeWordSearch {
+			if m.mode == modeSearch || m.mode == modeTranslationSelect || m.mode == modeThemeSelect || m.mode == modeAbout || m.mode == modeComparison || m.mode == modeWordSearch || m.mode == modeCacheManager {
+				// Picker was opened from a comparison column: dismiss
+				// it back into comparison view instead of dropping all
+				// the way down to the reader.
+				if m.mode == modeTranslationSelect && m.comparisonPickerColumn >= 0 {
+					m.comparisonPickerColumn = -1
+					m.mode = modeComparison
+					return m, nil
+				}
 				m.mode = modeReader
 				m.wordSearchResults = nil
 				m.wordSearchInput.SetValue("")
 				return m, nil
 			}
+			if m.focus == paneBooks {
+				m.focus = paneContent
+				return m, nil
+			}
 		}
 
-	case tea.MouseMsg:
-		if m.showSidebar {
-			if msg.Type == tea.MouseLeft {
-				// Handle mouse clicks in sidebar
-				// Sidebar is 30 chars wide + 4 for border/padding
-				if msg.X < 34 {
-					// Calculate which book was clicked
-					// Account for header, padding, and section titles
-					clickY := msg.Y - 5 // Adjust for header and padding
+	case tea.MouseClickMsg:
+		m.mouseX, m.mouseY = msg.X, msg.Y
+		if msg.Button != tea.MouseLeft {
+			break
+		}
 
-					if clickY >= 0 && m.books != nil {
-						bookIndex := 0
-						currentY := 0
+		// Overlay is active: clicks inside its panel select items;
+		// clicks outside close the overlay.
+		if m.overlayActive() {
+			px, py, pw, ph := m.overlayPanelBounds()
+			inside := msg.X >= px && msg.X < px+pw && msg.Y >= py && msg.Y < py+ph
+			if !inside {
+				// Picker scoped to a comparison column drops back to
+				// comparison view, not all the way to the reader.
+				if m.mode == modeTranslationSelect && m.comparisonPickerColumn >= 0 {
+					m.comparisonPickerColumn = -1
+					m.mode = modeComparison
+					return m, nil
+				}
+				m.mode = modeReader
+				m.wordSearchResults = nil
+				m.wordSearchInput.SetValue("")
+				return m, nil
+			}
+			// Inner content area sits one row in from the top border and
+			// one row down for the box's top padding, plus the panel's
+			// title line and its trailing blank line. Item rows then start.
+			rowInPanel := msg.Y - py - 1 - 1 - 1 - 1
+			cmd := m.overlayClick(rowInPanel)
+			return m, cmd
+		}
 
-						// Skip "OLD TESTAMENT" header (2 lines)
-						if clickY < 2 {
-							return m, nil
-						}
-						currentY = 2
+		// Click in the left (books) pane — select & load that book.
+		if msg.X >= 0 && msg.X < leftPaneOuterWidth && msg.Y >= headerOuterHeight+2 {
+			m.focus = paneBooks
+			if i, ok := m.bookAtRow(msg.Y); ok {
+				m.sidebarSelected = i
+				m.currentBook = m.books[i].BookID
+				m.currentBookName = m.books[i].Name
+				m.currentChapter = 1
+				m.focus = paneContent
+				m.loading = true
+				return m, loadChapter(m.client, m.selectedTranslation, m.currentBook, m.currentChapter)
+			}
+			return m, nil
+		}
 
-						// Old Testament books
-						for i, book := range m.books {
-							if book.BookID > 39 {
+		// Comparison view: click on a column header opens the
+		// translation picker scoped to that column.
+		if m.mode == modeComparison && msg.X >= leftPaneOuterWidth {
+			viewportTopY := headerOuterHeight + 4 // app header (3) + pane border (1) + top pad (1) + title (1) + spacer (1) - 2
+			// Header occupies the first 2 lines of the viewport
+			// (translation labels + ─ separator). Only trigger when
+			// the viewport is at the top so the click coordinates match.
+			if m.viewport.YOffset() == 0 && (msg.Y == viewportTopY || msg.Y == viewportTopY+1) {
+				if col := m.comparisonColumnAtX(msg.X); col >= 0 {
+					m.comparisonPickerColumn = col
+					m.mode = modeTranslationSelect
+					m.translationSelected = 0
+					if m.translations != nil {
+						for i, t := range m.translations {
+							if t.ShortName == m.comparisonTranslations[col] {
+								m.translationSelected = i
 								break
 							}
-							if clickY == currentY {
-								bookIndex = i
-								m.sidebarSelected = bookIndex
-								m.currentBook = m.books[bookIndex].BookID
-								m.currentBookName = m.books[bookIndex].Name
-								m.currentChapter = 1
-								m.showSidebar = false
-								m.loading = true
-								return m, loadChapter(m.client, m.selectedTranslation, m.currentBook, m.currentChapter)
-							}
-							currentY++
-						}
-
-						// Skip "NEW TESTAMENT" header (2 lines)
-						currentY += 2
-
-						// New Testament books
-						for i, book := range m.books {
-							if book.BookID < 40 {
-								continue
-							}
-							if clickY == currentY {
-								bookIndex = i
-								m.sidebarSelected = bookIndex
-								m.currentBook = m.books[bookIndex].BookID
-								m.currentBookName = m.books[bookIndex].Name
-								m.currentChapter = 1
-								m.showSidebar = false
-								m.loading = true
-								return m, loadChapter(m.client, m.selectedTranslation, m.currentBook, m.currentChapter)
-							}
-							currentY++
 						}
 					}
+					return m, nil
 				}
 			}
-		} else {
-			// Pass mouse events to viewport for scrolling
+		}
+
+		// Click in the right (content) pane — focus it, and if the click
+		// landed on a verse line, treat it as a selection.
+		//
+		//   plain left-click       → highlight just that verse, record
+		//                            it as the drag anchor so a
+		//                            subsequent drag extends a range
+		//   shift+left-click       → extend the existing highlight to
+		//                            span from the previous anchor to
+		//                            the clicked verse
+		//   left-click and drag    → range grows live as the mouse moves
+		//                            (handled in MouseMotionMsg)
+		//
+		// The range is always normalized so start ≤ end.
+		if msg.X >= leftPaneOuterWidth {
+			m.focus = paneContent
+			if v := m.verseAtMouseY(msg.Y); v > 0 && m.mode == modeReader && m.currentVerses != nil {
+				if msg.Mod&tea.ModShift != 0 && m.highlightedVerseStart > 0 {
+					anchor := m.highlightedVerseStart
+					if m.highlightedVerseStart > m.highlightedVerseEnd {
+						anchor = m.highlightedVerseEnd
+					}
+					start, end := anchor, v
+					if start > end {
+						start, end = end, start
+					}
+					m.highlightedVerseStart = start
+					m.highlightedVerseEnd = end
+				} else {
+					m.highlightedVerseStart = v
+					m.highlightedVerseEnd = v
+					m.dragAnchorVerse = v
+				}
+				m.content = m.formatChapter(m.currentVerses, m.currentBookName, m.currentChapter, m.viewport.Width(), m.highlightedVerseStart, m.highlightedVerseEnd)
+				m.viewport.SetContent(m.content)
+			}
+		}
+
+	case tea.MouseReleaseMsg:
+		m.mouseX, m.mouseY = msg.X, msg.Y
+		// End of a click-and-drag selection.
+		m.dragAnchorVerse = 0
+
+	case tea.MouseMotionMsg:
+		// Skip the model update when the cursor didn't actually change
+		// cells so we avoid a re-render on every micro-movement.
+		if msg.X == m.mouseX && msg.Y == m.mouseY {
+			return m, nil
+		}
+		m.mouseX, m.mouseY = msg.X, msg.Y
+
+		// If the left button is held AND we recorded a drag anchor on
+		// the original click, extend the highlight range live to span
+		// from the anchor to whichever verse is now under the cursor.
+		// This is the modifier-less alternative to shift+click — any
+		// terminal that passes mouse motion through (the same ones
+		// that pass clicks) will let it work.
+		if msg.Button == tea.MouseLeft && m.dragAnchorVerse > 0 && m.mode == modeReader && m.currentVerses != nil {
+			if v := m.verseAtMouseY(msg.Y); v > 0 {
+				start, end := m.dragAnchorVerse, v
+				if start > end {
+					start, end = end, start
+				}
+				if start != m.highlightedVerseStart || end != m.highlightedVerseEnd {
+					m.highlightedVerseStart = start
+					m.highlightedVerseEnd = end
+					m.content = m.formatChapter(m.currentVerses, m.currentBookName, m.currentChapter, m.viewport.Width(), m.highlightedVerseStart, m.highlightedVerseEnd)
+					m.viewport.SetContent(m.content)
+				}
+			}
+		}
+		return m, nil
+
+	case tea.MouseWheelMsg:
+		m.mouseX, m.mouseY = msg.X, msg.Y
+		// Inside an active overlay, the wheel navigates its selection.
+		if m.overlayActive() {
+			switch msg.Button {
+			case tea.MouseWheelUp:
+				m.overlayNudge(-1)
+			case tea.MouseWheelDown:
+				m.overlayNudge(+1)
+			}
+			return m, nil
+		}
+		// Inside the books pane, the wheel moves the highlighted book.
+		if msg.X >= 0 && msg.X < leftPaneOuterWidth && m.books != nil {
+			switch msg.Button {
+			case tea.MouseWheelUp:
+				if m.sidebarSelected > 0 {
+					m.sidebarSelected--
+				}
+			case tea.MouseWheelDown:
+				if m.sidebarSelected < len(m.books)-1 {
+					m.sidebarSelected++
+				}
+			}
+			m.focus = paneBooks
+			return m, nil
+		}
+		// Otherwise forward to the viewport in the content pane.
+		if m.focus == paneContent || msg.X >= leftPaneOuterWidth {
 			m.viewport, cmd = m.viewport.Update(msg)
 			cmds = append(cmds, cmd)
+		}
+
+	case tea.BackgroundColorMsg:
+		// Only act on the first BackgroundColorMsg if the user hasn't
+		// pinned a theme. Pick a sensible default for the terminal's
+		// luma. This runs once at startup (Init asks for the bg color).
+		if !m.themePinned {
+			var chosen theme.Theme
+			if msg.IsDark() {
+				chosen = theme.CatppuccinMocha
+			} else {
+				chosen = theme.CatppuccinLatte
+			}
+			m.currentTheme = chosen
+			// Sync themeSelected so the picker opens on the right row
+			// next time the user presses T.
+			for i, th := range theme.AllThemes() {
+				if th.Name == chosen.Name {
+					m.themeSelected = i
+					break
+				}
+			}
 		}
 
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
 
+		vpW, vpH := m.viewportSize()
+
 		if !m.ready {
-			m.viewport = viewport.New(msg.Width, msg.Height-6)
+			m.viewport = viewport.New(viewport.WithWidth(vpW), viewport.WithHeight(vpH))
 			m.viewport.YPosition = 4
 			m.ready = true
 		} else {
-			m.viewport.Width = msg.Width
-			m.viewport.Height = msg.Height - 6
+			m.viewport.SetWidth(vpW)
+			m.viewport.SetHeight(vpH)
 		}
 
 		// Reformat content with new width
 		if m.currentVerses != nil {
-			m.content = m.formatChapter(m.currentVerses, m.currentBookName, m.currentChapter, m.width, m.highlightedVerseStart, m.highlightedVerseEnd)
+			m.content = m.formatChapter(m.currentVerses, m.currentBookName, m.currentChapter, vpW, m.highlightedVerseStart, m.highlightedVerseEnd)
 		} else if m.currentParallelVerses != nil {
-			m.content = m.formatParallelVerses(m.currentParallelVerses, m.comparisonTranslations, m.currentBookName, m.currentChapter, m.width)
+			m.content = m.formatParallelVerses(m.currentParallelVerses, m.comparisonTranslations, m.currentBookName, m.currentChapter, vpW)
 		}
 		m.viewport.SetContent(m.content)
 
@@ -926,21 +1196,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.highlightedVerseEnd = 1
 			}
 		}
-		m.content = m.formatChapter(msg.verses, m.currentBookName, m.currentChapter, m.width, m.highlightedVerseStart, m.highlightedVerseEnd)
+		m.content = m.formatChapter(msg.verses, m.currentBookName, m.currentChapter, m.viewport.Width(), m.highlightedVerseStart, m.highlightedVerseEnd)
 		m.viewport.SetContent(m.content)
 
 		// If we came from a search, scroll to the highlighted verse
 		if cameFromSearch {
 			m.scrollToHighlightedVerse()
+			m.topVisibleVerse = m.highlightedVerseStart
 		} else {
 			m.viewport.GotoTop()
+			m.topVisibleVerse = 0
 		}
 
 	case parallelVersesLoadedMsg:
 		m.loading = false
 		m.currentParallelVerses = msg.verses
 		m.currentVerses = nil
-		m.content = m.formatParallelVerses(msg.verses, m.comparisonTranslations, m.currentBookName, m.currentChapter, m.width)
+		m.content = m.formatParallelVerses(msg.verses, m.comparisonTranslations, m.currentBookName, m.currentChapter, m.viewport.Width())
 		m.viewport.SetContent(m.content)
 		m.viewport.GotoTop()
 
@@ -949,13 +1221,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case downloadCompleteMsg:
 		m.downloadingTranslation = ""
+		m.downloadProgress = 0
 		if m.cache != nil {
 			return m, loadCachedList(m.cache)
 		}
 
 	case downloadErrorMsg:
 		m.downloadingTranslation = ""
+		m.downloadProgress = 0
 		m.err = msg.err
+
+	case downloadTickMsg:
+		// Poll the cache for current byte-level progress and reschedule
+		// the next tick if a download is still running.
+		if m.downloadingTranslation != "" && m.cache != nil {
+			p, _ := m.cache.DownloadProgress()
+			m.downloadProgress = p
+			return m, downloadTick()
+		}
 
 	case searchResultsLoadedMsg:
 		m.wordSearchLoading = false
@@ -1001,18 +1284,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.millerVerseIdx = 0
 		}
 	} else {
-		oldYOffset := m.viewport.YOffset
+		oldYOffset := m.viewport.YOffset()
 		m.viewport, cmd = m.viewport.Update(msg)
 		cmds = append(cmds, cmd)
 
-		// Update highlighted verse based on viewport position
-		if m.currentVerses != nil && oldYOffset != m.viewport.YOffset {
-			newHighlightedVerse := m.calculateHighlightedVerse()
-			if newHighlightedVerse != m.highlightedVerseStart {
-				m.highlightedVerseStart = newHighlightedVerse
-				m.highlightedVerseEnd = newHighlightedVerse
-				// Reformat content with new highlighted verse
-				m.content = m.formatChapter(m.currentVerses, m.currentBookName, m.currentChapter, m.width, m.highlightedVerseStart, m.highlightedVerseEnd)
+		// Update highlighted verse + the sticky-header top-visible verse
+		// based on viewport position.
+		if m.currentVerses != nil && oldYOffset != m.viewport.YOffset() {
+			newTopVerse := m.calculateHighlightedVerse()
+			m.topVisibleVerse = newTopVerse
+			if m.viewport.YOffset() == 0 {
+				// Back at the top: drop the sticky indicator.
+				m.topVisibleVerse = 0
+			}
+			if newTopVerse != m.highlightedVerseStart {
+				m.highlightedVerseStart = newTopVerse
+				m.highlightedVerseEnd = newTopVerse
+				m.content = m.formatChapter(m.currentVerses, m.currentBookName, m.currentChapter, m.viewport.Width(), m.highlightedVerseStart, m.highlightedVerseEnd)
 				m.viewport.SetContent(m.content)
 			}
 		}
@@ -1021,171 +1309,991 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(cmds...)
 }
 
-func (m Model) View() string {
+func (m Model) View() tea.View {
+	return tea.View{
+		Content:   m.renderView(),
+		AltScreen: true,
+		// AllMotion gives us motion events even when no button is held,
+		// which is what we need for hover highlights.
+		MouseMode: tea.MouseModeAllMotion,
+	}
+}
+
+// Layout constants for the two-pane shell.
+const (
+	leftPaneOuterWidth = 30 // books pane outer width incl. rounded border
+	headerOuterHeight  = 3  // header rounded box: 1 content + 2 border lines
+	statusOuterHeight  = 3  // status bar rounded box: same
+)
+
+// viewportSize returns the inner content width/height of the right pane.
+// The right pane outer width is m.width - leftPaneOuterWidth.
+// We subtract: 2 for the rounded border and 4 for padding(1, 2) so the
+// viewport fills the pane's inner content area exactly (no unstyled gap
+// at the right edge).
+func (m Model) viewportSize() (int, int) {
+	w := m.width - leftPaneOuterWidth - 2 - 4
+	if w < 20 {
+		w = 20
+	}
+	h := m.height - headerOuterHeight - statusOuterHeight - 2 - 2 - 2
+	if h < 5 {
+		h = 5
+	}
+	return w, h
+}
+
+// overlayActive reports whether the current mode draws a floating panel
+// on top of the two-pane shell.
+func (m Model) overlayActive() bool {
+	switch m.mode {
+	case modeSearch, modeTranslationSelect, modeThemeSelect,
+		modeCacheManager, modeAbout, modeWordSearch:
+		return true
+	}
+	return false
+}
+
+func (m Model) renderView() string {
 	if !m.ready {
 		return "\n  Initializing..."
 	}
 
-	headerStyle := lipgloss.NewStyle().
-		Bold(true).
-		Foreground(m.currentTheme.Accent).
-		BorderStyle(lipgloss.NormalBorder()).
-		BorderBottom(true).
-		BorderForeground(m.currentTheme.Border)
+	if m.width < 60 || m.height < 18 {
+		fitStyle := lipgloss.NewStyle().
+			Foreground(m.currentTheme.Warning).
+			Bold(true)
+		return "\n  " + fitStyle.Render("Terminal too small — resize to at least 60×18.")
+	}
 
-	titleStyle := lipgloss.NewStyle().
-		Bold(true).
-		Foreground(m.currentTheme.Success)
+	header := m.renderHeader()
+	body := m.renderBody()
+	status := m.renderStatusBar()
 
-	helpStyle := lipgloss.NewStyle().
-		Foreground(m.currentTheme.Muted)
+	base := lipgloss.JoinVertical(lipgloss.Left, header, body, status)
 
-	errorStyle := lipgloss.NewStyle().
-		Foreground(m.currentTheme.Error).
-		Bold(true)
+	if !m.overlayActive() {
+		return base
+	}
 
-	// Logo using Unicode character U+100C9
-	logo := "\U000100C9"
-	logoStyle := lipgloss.NewStyle().
-		Foreground(m.currentTheme.Accent).
-		Bold(true)
+	return m.composeOverlay(base)
+}
 
-	var header string
-	if m.mode == modeSearch {
-		header = headerStyle.Render(logoStyle.Render(logo)+" Search - Enter verse reference") + "\n" + m.textInput.View()
-	} else if m.mode == modeTranslationSelect {
-		header = headerStyle.Render(logoStyle.Render(logo) + " Select Translation")
-	} else if m.mode == modeThemeSelect {
-		header = headerStyle.Render(logoStyle.Render(logo) + " Select Theme")
-	} else if m.mode == modeComparison {
-		header = headerStyle.Render(logoStyle.Render(logo) + " " + fmt.Sprintf("Comparison View - %s %d", m.currentBookName, m.currentChapter))
-	} else if m.mode == modeCacheManager {
-		header = headerStyle.Render(logoStyle.Render(logo) + " Download Translations")
-	} else if m.mode == modeAbout {
-		header = headerStyle.Render(logoStyle.Render(logo) + " About")
-	} else if m.mode == modeWordSearch {
-		header = headerStyle.Render(logoStyle.Render(logo) + " Search Bible")
+func (m Model) renderHeader() string {
+	width := m.width
+
+	bg := m.currentTheme.Background
+	accent := m.currentTheme.Accent
+	successCol := m.currentTheme.Success
+
+	logo := "†"
+	logoStyle := lipgloss.NewStyle().Foreground(accent).Background(bg).Bold(true)
+	breadcrumbStyle := lipgloss.NewStyle().Foreground(m.currentTheme.Primary).Background(bg)
+	separatorStyle := lipgloss.NewStyle().Foreground(m.currentTheme.Muted).Background(bg)
+	versionStyle := lipgloss.NewStyle().Foreground(successCol).Background(bg).Bold(true)
+
+	bookName := m.currentBookName
+	if bookName == "" {
+		bookName = "—"
+	}
+	chapter := fmt.Sprintf("%d", m.currentChapter)
+	if m.currentChapter == 0 {
+		chapter = "—"
+	}
+
+	breadcrumb := logoStyle.Render(logo+" sword-tui") +
+		separatorStyle.Render("  ·  ") +
+		breadcrumbStyle.Render(m.selectedTranslation) +
+		separatorStyle.Render(" › ") +
+		breadcrumbStyle.Render(bookName) +
+		separatorStyle.Render(" › ") +
+		breadcrumbStyle.Render(chapter)
+
+	versionStr := versionStyle.Render(version.Version)
+
+	innerWidth := width - 4 - 2 // -2 border -2 padding -2 safety
+	rightW := lipgloss.Width(versionStr)
+	leftW := innerWidth - rightW - 1
+	if leftW < 1 {
+		leftW = 1
+	}
+	leftSlot := lipgloss.NewStyle().
+		Background(bg).
+		Width(leftW).
+		MaxWidth(leftW).
+		Render(breadcrumb)
+	gap := lipgloss.NewStyle().Background(bg).Render(" ")
+	content := leftSlot + gap + versionStr
+
+	box := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(m.currentTheme.BorderActive).
+		BorderBackground(bg).
+		Background(bg).
+		Width(width - 2).
+		Padding(0, 1)
+
+	return box.Render(content)
+}
+
+func (m Model) renderStatusBar() string {
+	width := m.width
+	bg := m.currentTheme.Background
+
+	hintStyle := lipgloss.NewStyle().Foreground(m.currentTheme.Muted).Background(bg)
+	keyStyle := lipgloss.NewStyle().Foreground(m.currentTheme.Accent).Background(bg).Bold(true)
+	rightStyle := lipgloss.NewStyle().Background(bg)
+
+	hints := m.statusHints(keyStyle, hintStyle)
+
+	// Right side: loading indicator or error condensed
+	var right string
+	if m.loading {
+		right = lipgloss.NewStyle().Foreground(m.currentTheme.Warning).Background(bg).Bold(true).Render("● loading")
+	} else if m.err != nil {
+		errStyle := lipgloss.NewStyle().Foreground(m.currentTheme.Error).Background(bg).Bold(true)
+		msg := m.err.Error()
+		if len(msg) > 40 {
+			msg = msg[:37] + "..."
+		}
+		right = errStyle.Render("⚠ " + msg)
+	} else if m.cache != nil && m.cache.IsCached(m.selectedTranslation) {
+		right = lipgloss.NewStyle().Foreground(m.currentTheme.Success).Background(bg).Render("● offline")
 	} else {
-		// Check if current translation is cached
-		offlineIndicator := ""
-		if m.cache != nil && m.cache.IsCached(m.selectedTranslation) {
-			offlineStyle := lipgloss.NewStyle().
-				Foreground(m.currentTheme.Success)
-			offlineIndicator = " " + offlineStyle.Render("[Offline]")
+		right = hintStyle.Render("● online")
+	}
+
+	innerWidth := width - 4 - 2 // -2 border -2 padding -2 safety
+	rightW := lipgloss.Width(right)
+	leftW := innerWidth - rightW - 1
+	if leftW < 1 {
+		leftW = 1
+	}
+	hintsSlot := rightStyle.Width(leftW).MaxWidth(leftW).Render(hints)
+	gap := lipgloss.NewStyle().Background(bg).Render(" ")
+
+	box := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(m.currentTheme.Border).
+		BorderBackground(bg).
+		Background(bg).
+		Width(width - 2).
+		Padding(0, 1)
+
+	return box.Render(hintsSlot + gap + right)
+}
+
+func (m Model) statusHints(key, dim lipgloss.Style) string {
+	type hint struct{ k, label string }
+
+	var hs []hint
+	switch m.mode {
+	case modeTranslationSelect, modeThemeSelect:
+		hs = []hint{{"↑↓", "navigate"}, {"⏎", "select"}, {"esc", "close"}}
+	case modeCacheManager:
+		hs = []hint{{"↑↓", "navigate"}, {"⏎", "download"}, {"x", "delete"}, {"esc", "close"}}
+	case modeAbout:
+		hs = []hint{{"esc", "close"}}
+	case modeWordSearch:
+		if m.wordSearchResults != nil {
+			hs = []hint{{"↑↓", "navigate"}, {"⏎", "go to verse"}, {"esc", "close"}}
+		} else {
+			hs = []hint{{"⏎", "search"}, {"esc", "close"}}
+		}
+	case modeComparison:
+		hs = []hint{{"↑↓", "scroll"}, {"r", "reader"}, {"esc", "back"}}
+	case modeSearch:
+		hs = []hint{{"⏎", "go"}, {"esc", "cancel"}}
+	default:
+		hs = []hint{
+			{"tab", "focus"},
+			{"⏎", "open"},
+			{"n/p", "chapter"},
+			{"t", "translation"},
+			{"T", "theme"},
+			{"/", "verse"},
+			{"s", "search"},
+			{"?", "about"},
+			{"q", "quit"},
+		}
+	}
+
+	// Each part bundles the key + leading space + label into a single
+	// dim.Render() so the gap between the styled key and label gets the
+	// pane background (raw spaces between two styled spans would inherit
+	// the terminal default and show through as black blocks).
+	var parts []string
+	for _, h := range hs {
+		parts = append(parts, key.Render(h.k)+dim.Render(" "+h.label))
+	}
+	return strings.Join(parts, dim.Render("  ·  "))
+}
+
+func (m Model) renderBody() string {
+	bodyHeight := m.height - headerOuterHeight - statusOuterHeight
+	if bodyHeight < 5 {
+		bodyHeight = 5
+	}
+
+	leftW := leftPaneOuterWidth
+	rightW := m.width - leftW
+
+	left := m.renderLeftPane(leftW, bodyHeight)
+	right := m.renderRightPane(rightW, bodyHeight)
+
+	return lipgloss.JoinHorizontal(lipgloss.Top, left, right)
+}
+
+func (m Model) renderLeftPane(outerW, outerH int) string {
+	active := m.focus == paneBooks && !m.overlayActive()
+	border := m.currentTheme.Border
+	if active {
+		border = m.currentTheme.BorderActive
+	}
+	bg := m.currentTheme.Background
+
+	titleStyle := lipgloss.NewStyle().Foreground(m.currentTheme.Accent).Background(bg).Bold(true)
+	sectionStyle := lipgloss.NewStyle().Foreground(m.currentTheme.Success).Background(bg).Bold(true)
+	selectedStyle := lipgloss.NewStyle().
+		Foreground(m.currentTheme.Background).
+		Background(m.currentTheme.Accent).
+		Bold(true)
+	currentStyle := lipgloss.NewStyle().Foreground(m.currentTheme.Warning).Background(bg).Bold(true)
+	normalStyle := lipgloss.NewStyle().Foreground(m.currentTheme.Primary).Background(bg)
+	hoverStyle := lipgloss.NewStyle().Foreground(m.currentTheme.Primary).Background(m.currentTheme.Highlight)
+	mutedStyle := lipgloss.NewStyle().Foreground(m.currentTheme.Muted).Background(bg).Italic(true)
+
+	// Resolve hover only when the mouse is actually inside this pane.
+	hoveredBookIdx := -1
+	if !m.overlayActive() && m.mouseX >= 0 && m.mouseX < leftPaneOuterWidth {
+		if hi, ok := m.bookAtRow(m.mouseY); ok {
+			hoveredBookIdx = hi
+		}
+	}
+
+	innerW := outerW - 4 // 2 border + 2 padding
+	innerH := outerH - 4 // 2 border + 2 padding
+
+	var sb strings.Builder
+	sb.WriteString(titleStyle.Render("Books"))
+	sb.WriteString("\n")
+
+	// Reserve: 1 for the "Books" title above, plus 2 (one per direction)
+	// for the "↑ N more" / "↓ N more" indicators when virtual scrolling.
+	contentLines := innerH - 1 - 2
+	if contentLines < 1 {
+		contentLines = 1
+	}
+
+	if m.books == nil {
+		sb.WriteString(mutedStyle.Render("Loading…"))
+	} else {
+		type entry struct {
+			isHeader bool
+			label    string
+			bookIdx  int
+			isCur    bool
+			isSel    bool
+		}
+		var entries []entry
+		entries = append(entries, entry{isHeader: true, label: "OLD TESTAMENT"})
+		for i, b := range m.books {
+			if b.BookID > 39 {
+				continue
+			}
+			label := b.Name
+			if lipgloss.Width(label) > innerW-2 {
+				label = label[:innerW-2]
+			}
+			entries = append(entries, entry{
+				label:   label,
+				bookIdx: i,
+				isCur:   b.BookID == m.currentBook,
+				isSel:   i == m.sidebarSelected,
+			})
+		}
+		entries = append(entries, entry{isHeader: true, label: "NEW TESTAMENT"})
+		for i, b := range m.books {
+			if b.BookID < 40 {
+				continue
+			}
+			label := b.Name
+			if lipgloss.Width(label) > innerW-2 {
+				label = label[:innerW-2]
+			}
+			entries = append(entries, entry{
+				label:   label,
+				bookIdx: i,
+				isCur:   b.BookID == m.currentBook,
+				isSel:   i == m.sidebarSelected,
+			})
 		}
 
-		// Build title with verse reference if verses are highlighted from search
-		var titleText string
-		if m.highlightedVerseStart > 0 {
-			if m.highlightedVerseStart == m.highlightedVerseEnd {
-				// Single verse
-				titleText = fmt.Sprintf("Search: %s %s %d:%d", m.selectedTranslation, m.currentBookName, m.currentChapter, m.highlightedVerseStart)
+		// Virtual scrolling: center on selected index
+		selIdx := -1
+		for i, e := range entries {
+			if e.isSel {
+				selIdx = i
+				break
+			}
+		}
+		start, end := 0, len(entries)
+		if len(entries) > contentLines {
+			if selIdx < 0 {
+				selIdx = 0
+			}
+			half := contentLines / 2
+			start = selIdx - half
+			if start < 0 {
+				start = 0
+			}
+			end = start + contentLines
+			if end > len(entries) {
+				end = len(entries)
+				start = end - contentLines
+				if start < 0 {
+					start = 0
+				}
+			}
+		}
+
+		if start > 0 {
+			sb.WriteString(mutedStyle.Render(fmt.Sprintf("↑ %d more", start)) + "\n")
+		}
+		for i := start; i < end; i++ {
+			e := entries[i]
+			if e.isHeader {
+				sb.WriteString(sectionStyle.Render(e.label) + "\n")
+				continue
+			}
+			line := "  " + e.label
+			isHovered := e.bookIdx == hoveredBookIdx && !e.isSel
+			if e.isSel {
+				line = "▸ " + e.label
+				// pad to innerW to fill the highlight bar
+				if lipgloss.Width(line) < innerW {
+					line = line + strings.Repeat(" ", innerW-lipgloss.Width(line))
+				}
+				sb.WriteString(selectedStyle.Render(line) + "\n")
+				continue
+			}
+			if isHovered {
+				// Pad to fill the row so the hover bg covers the entire
+				// pane width, not just the text.
+				if lipgloss.Width(line) < innerW {
+					line = line + strings.Repeat(" ", innerW-lipgloss.Width(line))
+				}
+				sb.WriteString(hoverStyle.Render(line) + "\n")
+				continue
+			}
+			if e.isCur {
+				sb.WriteString(currentStyle.Render(line) + "\n")
+				continue
+			}
+			sb.WriteString(normalStyle.Render(line) + "\n")
+		}
+		if end < len(entries) {
+			sb.WriteString(mutedStyle.Render(fmt.Sprintf("↓ %d more", len(entries)-end)))
+		}
+	}
+
+	// Pad content to exactly fill innerH so the box sizes consistently with
+	// the right pane.
+	written := sb.String()
+	lines := strings.Count(written, "\n") + 1
+	if !strings.HasSuffix(written, "\n") {
+		// last line already accounted for
+	}
+	for lines < innerH {
+		sb.WriteString("\n")
+		lines++
+	}
+
+	box := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(border).
+		BorderBackground(bg).
+		Background(bg).
+		Width(outerW - 2).
+		Padding(1, 1)
+
+	return box.Render(sb.String())
+}
+
+func (m Model) renderRightPane(outerW, outerH int) string {
+	active := m.focus == paneContent && !m.overlayActive()
+	border := m.currentTheme.Border
+	if active {
+		border = m.currentTheme.BorderActive
+	}
+	bg := m.currentTheme.Background
+
+	titleStyle := lipgloss.NewStyle().Foreground(m.currentTheme.Accent).Background(bg).Bold(true)
+	mutedStyle := lipgloss.NewStyle().Foreground(m.currentTheme.Muted).Background(bg).Italic(true)
+
+	var titleText string
+	switch m.mode {
+	case modeComparison:
+		titleText = fmt.Sprintf("Comparison · %s %d", m.currentBookName, m.currentChapter)
+	default:
+		if m.currentBookName == "" {
+			titleText = "Reader"
+		} else {
+			titleText = fmt.Sprintf("%s %d", m.currentBookName, m.currentChapter)
+		}
+	}
+
+	title := titleStyle.Render(titleText)
+
+	// Single sticky header: the title row itself surfaces the current
+	// reading position. When the viewport is scrolled past the top,
+	// append "↑ v. N" so the reader always sees where they are. When
+	// the user has explicitly selected a verse range but isn't scrolled
+	// (j/k inside the visible area), surface the verse range. The two
+	// states never duplicate.
+	scrolled := m.ready && m.viewport.YOffset() > 0 && m.mode == modeReader
+	var locator string
+	switch {
+	case scrolled && m.highlightedVerseStart > 0:
+		locator = mutedStyle.Render(fmt.Sprintf("  ↑ v. %d", m.highlightedVerseStart))
+	case !scrolled && m.highlightedVerseStart > 0 && m.highlightedVerseStart != m.highlightedVerseEnd:
+		locator = mutedStyle.Render(fmt.Sprintf("  v. %d–%d", m.highlightedVerseStart, m.highlightedVerseEnd))
+	case !scrolled && m.highlightedVerseStart > 1:
+		// Show the verse only when it's not the obvious "verse 1 at top".
+		locator = mutedStyle.Render(fmt.Sprintf("  v. %d", m.highlightedVerseStart))
+	}
+
+	// Hover indicator: when the mouse cursor is over a verse in the
+	// viewport, surface that verse number with a distinct ⊙ marker.
+	// Suppressed when the hovered verse happens to be the same one the
+	// locator above is already showing — no point saying it twice.
+	if hoveredVerse := m.verseAtMouseY(m.mouseY); hoveredVerse > 0 && hoveredVerse != m.highlightedVerseStart {
+		hoverStyle := lipgloss.NewStyle().Foreground(m.currentTheme.Accent).Background(bg).Bold(true)
+		locator += hoverStyle.Render(fmt.Sprintf("  ⊙ v. %d", hoveredVerse))
+	}
+
+	header := title + locator
+
+	body := m.viewport.View()
+
+	innerW := outerW - 2 - 4 // border + padding(1,2)
+	spacer := lipgloss.NewStyle().Background(bg).Width(innerW).Render("")
+
+	content := header + "\n" + spacer + "\n" + body
+
+	box := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(border).
+		BorderBackground(bg).
+		Background(bg).
+		Width(outerW - 2).
+		Height(outerH - 2).
+		Padding(1, 2)
+
+	return box.Render(content)
+}
+
+// comparisonVerseList returns the verse-number list we want
+// loadParallelVerses to fetch. In comparison mode m.currentVerses is
+// nil (cleared when parallelVersesLoadedMsg lands), so we derive the
+// list from the longest column we already have. Falls back to 1..31
+// when nothing's loaded yet (matches the initial "c" trigger).
+func (m Model) comparisonVerseList() []int {
+	maxV := 0
+	if m.currentVerses != nil {
+		for _, v := range m.currentVerses {
+			if v.Verse > maxV {
+				maxV = v.Verse
+			}
+		}
+	}
+	if m.currentParallelVerses != nil {
+		for _, vs := range m.currentParallelVerses {
+			for _, v := range vs {
+				if v.Verse > maxV {
+					maxV = v.Verse
+				}
+			}
+		}
+	}
+	if maxV == 0 {
+		maxV = 31
+	}
+	out := make([]int, maxV)
+	for i := range out {
+		out[i] = i + 1
+	}
+	return out
+}
+
+// comparisonColumnAtX returns the 0-based column index in
+// m.comparisonTranslations whose header sits under screen X x, or -1
+// if x is outside any column header. Only meaningful in modeComparison.
+func (m Model) comparisonColumnAtX(x int) int {
+	if m.mode != modeComparison || len(m.comparisonTranslations) == 0 {
+		return -1
+	}
+	// Right pane content area starts at: left pane (30) + right pane
+	// left border (1) + left padding (2) = 33.
+	contentX := leftPaneOuterWidth + 1 + 2
+	n := len(m.comparisonTranslations)
+	gaps := n - 1
+	colWidth := (m.viewport.Width() - gaps) / n
+	if colWidth < 20 {
+		colWidth = 20
+	}
+	relX := x - contentX
+	if relX < 0 {
+		return -1
+	}
+	stride := colWidth + 1 // colWidth + 1-cell gutter
+	for j := 0; j < n; j++ {
+		start := j * stride
+		if relX >= start && relX < start+colWidth {
+			return j
+		}
+	}
+	return -1
+}
+
+// verseAtMouseY returns the verse number the mouse cursor is currently
+// over inside the right pane viewport, or 0 if the cursor is somewhere
+// else (left pane, chrome, overlay, header/status bar). It mirrors the
+// line-counting logic in formatChapter so its mapping is consistent
+// with what's actually drawn.
+func (m Model) verseAtMouseY(y int) int {
+	if m.currentVerses == nil || len(m.currentVerses) == 0 {
+		return 0
+	}
+	if m.mouseX < leftPaneOuterWidth || m.overlayActive() {
+		return 0
+	}
+	// Viewport content starts at: app header (3) + right-pane border (1)
+	// + top padding (1) + title row (1) + spacer row (1) = 7.
+	viewportTopY := headerOuterHeight + 4
+	bottomY := viewportTopY + m.viewport.Height()
+	if y < viewportTopY || y >= bottomY {
+		return 0
+	}
+	line := y - viewportTopY + m.viewport.YOffset()
+	if line < 0 {
+		return 0
+	}
+
+	// Same width math as formatChapter (width - 8 from viewport width).
+	textWidth := m.viewport.Width() - 8
+	if textWidth < 12 {
+		textWidth = 12
+	}
+	indent := 6
+	currentLine := 0
+
+	for i, v := range m.currentVerses {
+		text := stripHTMLTags(v.Text)
+		isHighlighted := m.highlightedVerseStart > 0 && v.Verse >= m.highlightedVerseStart && v.Verse <= m.highlightedVerseEnd
+		nextIsHighlighted := false
+		if i+1 < len(m.currentVerses) {
+			nv := m.currentVerses[i+1]
+			nextIsHighlighted = m.highlightedVerseStart > 0 && nv.Verse >= m.highlightedVerseStart && nv.Verse <= m.highlightedVerseEnd
+		}
+
+		var verseLines int
+		if isHighlighted {
+			wrapped := wrapTextWithIndent(text, textWidth-4, indent)
+			ln := strings.Count(wrapped, "\n") + 1
+			if !nextIsHighlighted {
+				// end of range: wrapped content + top + bottom borders + 1 trailing blank
+				verseLines = ln + 2 + 1
 			} else {
-				// Verse range
-				titleText = fmt.Sprintf("Search: %s %s %d:%d-%d", m.selectedTranslation, m.currentBookName, m.currentChapter, m.highlightedVerseStart, m.highlightedVerseEnd)
+				// in-range verse contributes its lines plus a 1-line spacer
+				verseLines = ln + 1
 			}
 		} else {
-			titleText = fmt.Sprintf("%s %s %d", m.selectedTranslation, m.currentBookName, m.currentChapter)
+			wrapped := wrapTextWithIndent(text, textWidth, indent)
+			ln := strings.Count(wrapped, "\n") + 1
+			verseLines = ln + 1
 		}
 
-		title := logoStyle.Render(logo) + " " + titleStyle.Render(titleText) + offlineIndicator
-		header = headerStyle.Render(title)
-	}
-
-	// Create status bar with help and version
-	statusBarStyle := lipgloss.NewStyle().
-		Foreground(m.currentTheme.Muted).
-		BorderStyle(lipgloss.NormalBorder()).
-		BorderTop(true).
-		BorderForeground(m.currentTheme.Border)
-
-	versionStyle := lipgloss.NewStyle().
-		Foreground(m.currentTheme.Accent).
-		Bold(true)
-
-	// Format version string with build number
-	versionString := fmt.Sprintf("%s (build %s)", version.Version, version.BuildNumber)
-
-	var helpText string
-	if m.loading {
-		helpText = "Loading..."
-	} else if m.mode == modeTranslationSelect {
-		helpText = "↑/↓ or j/k: navigate | enter: select | esc: close"
-	} else if m.mode == modeThemeSelect {
-		helpText = "↑/↓ or j/k: navigate | enter: select | esc: close"
-	} else if m.mode == modeCacheManager {
-		helpText = "↑/↓ or j/k: navigate | enter: download | x: delete | esc: close"
-	} else if m.mode == modeAbout {
-		helpText = "esc: close"
-	} else if m.mode == modeWordSearch {
-		if m.wordSearchResults != nil {
-			helpText = "↑/↓ or j/k: navigate | enter: go to verse | esc: close"
-		} else {
-			helpText = "enter: search | esc: close"
+		if currentLine+verseLines > line {
+			return v.Verse
 		}
-	} else if m.mode == modeComparison {
-		helpText = "↑/↓ or j/k: scroll | r/esc: return to reader"
-	} else if m.showMillerColumns && m.millerFilterMode {
-		helpText = "Type to filter | enter/esc: exit filter mode"
-	} else if m.showMillerColumns {
-		helpText = "↑/↓ or j/k: navigate | ←/→ or h/l: switch column | /: filter | enter: select | v/esc: close"
-	} else if m.showSidebar {
-		helpText = "↑/↓ or j/k: navigate | enter: select | [/esc: close"
-	} else {
-		helpText = "[: books | v: verse picker | /: search | s: word search | c: compare | t: translation | T: theme | d: download | y: yank | ?: about | q: quit"
+		currentLine += verseLines
+	}
+	return 0
+}
+
+// overlayPanelBounds returns the (x, y, width, height) of the floating
+// overlay panel as it appears on screen. Must match composeOverlay.
+func (m Model) overlayPanelBounds() (int, int, int, int) {
+	panel := m.renderOverlayPanel()
+	if panel == "" {
+		return 0, 0, 0, 0
+	}
+	panelW := lipgloss.Width(panel)
+	panelH := lipgloss.Height(panel)
+	rightX := leftPaneOuterWidth
+	rightW := m.width - rightX
+	x := rightX + (rightW-panelW)/2
+	y := (m.height-panelH)/2 + 1
+	if x < 1 {
+		x = 1
+	}
+	if y < 1 {
+		y = 1
+	}
+	return x, y, panelW, panelH
+}
+
+// overlayClick resolves a click at row N (0-indexed from the first
+// list item) of the active overlay.
+func (m *Model) overlayClick(row int) tea.Cmd {
+	if row < 0 {
+		return nil
+	}
+	switch m.mode {
+	case modeThemeSelect:
+		themes := theme.AllThemes()
+		if row < len(themes) {
+			m.themeSelected = row
+			m.currentTheme = themes[row]
+			m.themePinned = true
+			m.mode = modeReader
+		}
+	case modeTranslationSelect:
+		if m.translations == nil {
+			return nil
+		}
+		start := m.overlayWindowStart(m.translationSelected, len(m.translations), 16)
+		offset := 0
+		if start > 0 {
+			offset = 1 // the "↑ N more" indicator line
+		}
+		idx := start + row - offset
+		if idx < 0 || idx >= len(m.translations) {
+			return nil
+		}
+		m.translationSelected = idx
+		newTrans := m.translations[idx].ShortName
+		// Picker scoped to a comparison column: swap that column.
+		if m.comparisonPickerColumn >= 0 && m.comparisonPickerColumn < len(m.comparisonTranslations) {
+			m.comparisonTranslations[m.comparisonPickerColumn] = newTrans
+			m.comparisonPickerColumn = -1
+			m.mode = modeComparison
+			m.loading = true
+			return loadParallelVerses(m.client, m.comparisonTranslations, m.currentBook, m.currentChapter, m.comparisonVerseList())
+		}
+		if newTrans == m.selectedTranslation {
+			m.mode = modeReader
+			return nil
+		}
+		m.selectedTranslation = newTrans
+		m.mode = modeReader
+		m.loading = true
+		return loadChapter(m.client, m.selectedTranslation, m.currentBook, m.currentChapter)
+	case modeCacheManager:
+		if m.translations == nil {
+			return nil
+		}
+		start := m.overlayWindowStart(m.cacheSelected, len(m.translations), 14)
+		offset := 0
+		if start > 0 {
+			offset = 1
+		}
+		idx := start + row - offset
+		if idx < 0 || idx >= len(m.translations) {
+			return nil
+		}
+		m.cacheSelected = idx
+		trans := m.translations[idx].ShortName
+		if m.cache != nil && !m.cache.IsCached(trans) && m.downloadingTranslation == "" {
+			m.downloadingTranslation = trans
+			m.downloadProgress = 0
+			return tea.Batch(downloadTranslation(m.cache, trans), downloadTick())
+		}
+	}
+	return nil
+}
+
+// overlayNudge moves the selection in the active overlay by delta (±1).
+func (m *Model) overlayNudge(delta int) {
+	switch m.mode {
+	case modeThemeSelect:
+		next := m.themeSelected + delta
+		max := len(theme.AllThemes()) - 1
+		if next < 0 {
+			next = 0
+		}
+		if next > max {
+			next = max
+		}
+		m.themeSelected = next
+	case modeTranslationSelect:
+		if m.translations == nil {
+			return
+		}
+		next := m.translationSelected + delta
+		if next < 0 {
+			next = 0
+		}
+		if next > len(m.translations)-1 {
+			next = len(m.translations) - 1
+		}
+		m.translationSelected = next
+	case modeCacheManager:
+		if m.translations == nil {
+			return
+		}
+		next := m.cacheSelected + delta
+		if next < 0 {
+			next = 0
+		}
+		if next > len(m.translations)-1 {
+			next = len(m.translations) - 1
+		}
+		m.cacheSelected = next
+	case modeWordSearch:
+		if m.wordSearchResults == nil {
+			return
+		}
+		next := m.wordSearchSelected + delta
+		if next < 0 {
+			next = 0
+		}
+		if next > len(m.wordSearchResults)-1 {
+			next = len(m.wordSearchResults) - 1
+		}
+		m.wordSearchSelected = next
+	}
+}
+
+// overlayWindowStart returns the start index of the visible window for a
+// list of n items with the given centered selection and window size.
+// Must mirror the windowing math used by the modal renderers.
+func (Model) overlayWindowStart(sel, n, window int) int {
+	if n <= window {
+		return 0
+	}
+	start := sel - window/2
+	if start < 0 {
+		start = 0
+	}
+	end := start + window
+	if end > n {
+		start = n - window
+	}
+	return start
+}
+
+// bookAtRow returns the book index whose row matches screen y in the
+// books pane, or false if y doesn't land on a book.
+func (m Model) bookAtRow(y int) (int, bool) {
+	if m.books == nil {
+		return 0, false
 	}
 
-	// Calculate padding to right-align version
-	helpLen := len(helpText)
-	versionLen := len(versionString)
-	totalLen := helpLen + versionLen + 3 // 3 for spacing
-	padding := ""
-	if m.width > totalLen {
-		padding = strings.Repeat(" ", m.width-totalLen)
+	// Inner content area starts at: header(3) + top border(1) + top padding(1).
+	contentY := y - headerOuterHeight - 2
+	if contentY < 0 {
+		return 0, false
 	}
 
-	help := statusBarStyle.Render(helpStyle.Render(helpText) + padding + versionStyle.Render(versionString))
-
-	var errorMsg string
-	if m.err != nil {
-		errorMsg = "\n" + errorStyle.Render(fmt.Sprintf("Error: %v", m.err))
+	// Replay the same windowing the renderer uses.
+	innerH := m.height - headerOuterHeight - statusOuterHeight - 4 // -2 border -2 padding
+	contentLines := innerH - 1 - 2                                // -title -indicators
+	if contentLines < 1 {
+		contentLines = 1
 	}
 
-	mainContent := fmt.Sprintf("%s\n%s\n%s%s", header, m.viewport.View(), help, errorMsg)
-
-	if m.mode == modeTranslationSelect {
-		return m.renderTranslationSelect(header, help, errorMsg)
+	type entry struct {
+		isHeader bool
+		bookIdx  int
+	}
+	var entries []entry
+	entries = append(entries, entry{isHeader: true})
+	for i, b := range m.books {
+		if b.BookID > 39 {
+			continue
+		}
+		entries = append(entries, entry{bookIdx: i})
+	}
+	entries = append(entries, entry{isHeader: true})
+	for i, b := range m.books {
+		if b.BookID < 40 {
+			continue
+		}
+		entries = append(entries, entry{bookIdx: i})
 	}
 
-	if m.mode == modeThemeSelect {
-		return m.renderThemeSelect(header, help, errorMsg)
+	selIdx := -1
+	for i := range entries {
+		if !entries[i].isHeader && entries[i].bookIdx == m.sidebarSelected {
+			selIdx = i
+			break
+		}
+	}
+	start, end := 0, len(entries)
+	if len(entries) > contentLines {
+		if selIdx < 0 {
+			selIdx = 0
+		}
+		half := contentLines / 2
+		start = selIdx - half
+		if start < 0 {
+			start = 0
+		}
+		end = start + contentLines
+		if end > len(entries) {
+			end = len(entries)
+			start = end - contentLines
+			if start < 0 {
+				start = 0
+			}
+		}
 	}
 
-	if m.mode == modeCacheManager {
-		return m.renderCacheManager(header, help, errorMsg)
+	// Now walk the rendered rows starting at contentY = 0 = "Books" title.
+	row := 0
+	if contentY == row {
+		return 0, false // "Books" title
+	}
+	row++
+	if start > 0 {
+		if contentY == row {
+			return 0, false // "↑ N more" indicator
+		}
+		row++
+	}
+	for i := start; i < end; i++ {
+		if contentY == row {
+			if entries[i].isHeader {
+				return 0, false
+			}
+			return entries[i].bookIdx, true
+		}
+		row++
+	}
+	return 0, false
+}
+
+func (m Model) composeOverlay(base string) string {
+	panel := m.renderOverlayPanel()
+	if panel == "" {
+		return base
+	}
+	panelW := lipgloss.Width(panel)
+	panelH := lipgloss.Height(panel)
+
+	// Center over the right pane
+	rightX := leftPaneOuterWidth
+	rightW := m.width - rightX
+	x := rightX + (rightW-panelW)/2
+	y := (m.height-panelH)/2 + 1
+	if x < 1 {
+		x = 1
+	}
+	if y < 1 {
+		y = 1
 	}
 
-	if m.mode == modeAbout {
-		return m.renderAbout(header, help, errorMsg)
+	shadowStyle := lipgloss.NewStyle().
+		Background(m.currentTheme.Shadow).
+		Foreground(m.currentTheme.Shadow)
+	shadowLine := shadowStyle.Render(strings.Repeat(" ", panelW))
+	shadowLines := make([]string, panelH)
+	for i := range shadowLines {
+		shadowLines[i] = shadowLine
 	}
+	shadow := strings.Join(shadowLines, "\n")
 
-	if m.mode == modeWordSearch {
-		return m.renderWordSearch(header, help, errorMsg)
+	compositor := lipgloss.NewCompositor(
+		lipgloss.NewLayer(base).X(0).Y(0).Z(0),
+		lipgloss.NewLayer(shadow).X(x+2).Y(y+1).Z(1),
+		lipgloss.NewLayer(panel).X(x).Y(y).Z(2),
+	)
+	canvas := lipgloss.NewCanvas(m.width, m.height)
+	canvas.Compose(compositor)
+	return canvas.Render()
+}
+
+func (m Model) renderOverlayPanel() string {
+	switch m.mode {
+	case modeSearch:
+		return m.renderSearchPanel()
+	case modeTranslationSelect:
+		return m.renderTranslationSelect()
+	case modeThemeSelect:
+		return m.renderThemeSelect()
+	case modeCacheManager:
+		return m.renderCacheManager()
+	case modeAbout:
+		return m.renderAbout()
+	case modeWordSearch:
+		return m.renderWordSearch()
 	}
+	return ""
+}
 
-	if m.showMillerColumns {
-		millerColumns := m.renderMillerColumns()
-		// Overlay Miller columns on top of the main content
-		return overlayContent(mainContent, millerColumns, m.width, m.height)
+func (m Model) renderSearchPanel() string {
+	bg := m.currentTheme.Background
+	titleStyle := lipgloss.NewStyle().Foreground(m.currentTheme.Accent).Background(bg).Bold(true)
+	hintStyle := lipgloss.NewStyle().Foreground(m.currentTheme.Muted).Background(bg).Italic(true)
+
+	// Size from the available right-pane area.
+	maxAvail := m.width - leftPaneOuterWidth - 8
+	width := maxAvail
+	if width > 64 {
+		width = 64
 	}
-
-	if m.showSidebar {
-		sidebar := m.renderSidebar()
-		// Overlay the sidebar on top of the main content
-		return overlayContent(mainContent, sidebar, m.width, m.height)
+	if width < 40 {
+		width = 40
 	}
+	innerW := width - 6
 
-	return mainContent
+	box := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(m.currentTheme.BorderActive).
+		BorderBackground(bg).
+		Background(bg).
+		Width(width).
+		Padding(1, 2)
+
+	// Apply the theme's background to the bubbles textinput so it doesn't
+	// punch a terminal-default-colored hole through the panel.
+	ti := m.textInput
+	ti.SetStyles(m.themedInputStyles())
+	ti.SetWidth(innerW - 2)
+
+	body := titleStyle.Render("Go to verse") + "\n\n" +
+		ti.View() + "\n\n" +
+		hintStyle.Render("e.g. \"John 3:16\" or \"1 1:1\"")
+
+	return box.Render(body)
+}
+
+// themedInputStyles returns textinput Styles that paint every cell of the
+// rendered input (prompt, text, placeholder, cursor backdrop) with the
+// current theme's background so the input blends into its panel.
+func (m Model) themedInputStyles() textinput.Styles {
+	bg := m.currentTheme.Background
+	primary := lipgloss.NewStyle().Foreground(m.currentTheme.Primary).Background(bg)
+	muted := lipgloss.NewStyle().Foreground(m.currentTheme.Muted).Background(bg).Italic(true)
+	prompt := lipgloss.NewStyle().Foreground(m.currentTheme.Accent).Background(bg).Bold(true)
+
+	state := textinput.StyleState{
+		Text:        primary,
+		Placeholder: muted,
+		Suggestion:  muted,
+		Prompt:      prompt,
+	}
+	return textinput.Styles{
+		Focused: state,
+		Blurred: state,
+		Cursor: textinput.CursorStyle{
+			Color: m.currentTheme.Accent,
+			Shape: tea.CursorBlock,
+			Blink: true,
+		},
+	}
 }
 
 func (m Model) calculateHighlightedVerse() int {
@@ -1194,15 +2302,14 @@ func (m Model) calculateHighlightedVerse() int {
 	}
 
 	// Calculate which verse is at the top of the viewport
-	yOffset := m.viewport.YOffset
+	yOffset := m.viewport.YOffset()
 
-	// Calculate text width the same way formatChapter does
-	textWidth := m.width - 6
-	if textWidth < 20 {
-		textWidth = 20
-	}
-	if textWidth > m.width-2 {
-		textWidth = m.width - 2
+	// Calculate text width the same way formatChapter does. We use the
+	// viewport's width (not m.width — that's the full terminal) and
+	// match formatChapter's `width - 8` for the textWidth.
+	textWidth := m.viewport.Width() - 8
+	if textWidth < 12 {
+		textWidth = 12
 	}
 
 	// Count lines to find which verse we're at
@@ -1229,8 +2336,9 @@ func (m Model) calculateHighlightedVerse() int {
 			linesInVerse := strings.Count(wrappedText, "\n") + 1
 
 			if !nextIsHighlighted {
-				// End of highlighted range - border adds 2 lines (top + bottom)
-				verseTotalLines = linesInVerse + 2 + 2
+				// End of highlighted range: wrapped content + 2 border
+				// lines (top + bottom) + 1 trailing blank.
+				verseTotalLines = linesInVerse + 2 + 1
 			} else {
 				// Middle of highlighted range
 				verseTotalLines = linesInVerse + 1
@@ -1286,7 +2394,7 @@ func (m *Model) scrollToHighlightedVerse() {
 
 			// Get the total number of lines in content
 			totalLines := strings.Count(m.content, "\n") + 1
-			maxOffset := totalLines - m.viewport.Height
+			maxOffset := totalLines - m.viewport.Height()
 			if maxOffset < 0 {
 				maxOffset = 0
 			}
@@ -1295,7 +2403,7 @@ func (m *Model) scrollToHighlightedVerse() {
 				targetOffset = maxOffset
 			}
 
-			m.viewport.YOffset = targetOffset
+			m.viewport.SetYOffset(targetOffset)
 			return
 		}
 
@@ -1874,222 +2982,452 @@ func (m Model) renderSidebar() string {
 	return result.String()
 }
 
-func (m Model) renderTranslationSelect(header, help, errorMsg string) string {
+func (m Model) renderTranslationSelect() string {
+	bg := m.currentTheme.Background
+
 	containerStyle := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(m.currentTheme.BorderActive).
+		BorderBackground(bg).
+		Background(bg).
+		Width(56).
 		Padding(1, 2)
 
+	titleStyle := lipgloss.NewStyle().Foreground(m.currentTheme.Accent).Background(bg).Bold(true)
+
 	selectedStyle := lipgloss.NewStyle().
-		Foreground(m.currentTheme.Accent).
-		Background(m.currentTheme.Highlight).
+		Foreground(bg).
+		Background(m.currentTheme.Accent).
 		Bold(true).
 		Padding(0, 1)
 
 	normalStyle := lipgloss.NewStyle().
 		Foreground(m.currentTheme.Primary).
+		Background(bg).
 		Padding(0, 1)
 
 	currentStyle := lipgloss.NewStyle().
 		Foreground(m.currentTheme.Success).
+		Background(bg).
 		Padding(0, 1)
 
 	var content strings.Builder
+	content.WriteString(titleStyle.Render("Select Translation") + "\n\n")
 
 	if m.translations != nil {
-		for i, trans := range m.translations {
+		// Show at most 16 translations centered on selection.
+		const window = 16
+		start, end := 0, len(m.translations)
+		if len(m.translations) > window {
+			start = m.translationSelected - window/2
+			if start < 0 {
+				start = 0
+			}
+			end = start + window
+			if end > len(m.translations) {
+				end = len(m.translations)
+				start = end - window
+			}
+		}
+		mutedStyle := lipgloss.NewStyle().Foreground(m.currentTheme.Muted).Background(bg).Italic(true)
+		if start > 0 {
+			content.WriteString(mutedStyle.Render(fmt.Sprintf("  ↑ %d more\n", start)))
+		}
+		for i := start; i < end; i++ {
+			trans := m.translations[i]
 			prefix := "  "
 			style := normalStyle
 			suffix := ""
-
-			// Check if this is the currently selected translation
 			isCurrent := trans.ShortName == m.selectedTranslation
-
 			if i == m.translationSelected {
-				prefix = "> "
+				prefix = "▸ "
 				style = selectedStyle
 			} else if isCurrent {
 				style = currentStyle
 			}
-
-			name := fmt.Sprintf("%-6s - %s", trans.ShortName, trans.FullName)
-
+			name := fmt.Sprintf("%-6s · %s", trans.ShortName, trans.FullName)
 			if isCurrent && i != m.translationSelected {
-				suffix = " [Current]"
+				suffix = "  ●"
 			}
-
 			content.WriteString(style.Render(prefix+name+suffix) + "\n")
+		}
+		if end < len(m.translations) {
+			content.WriteString(mutedStyle.Render(fmt.Sprintf("  ↓ %d more", len(m.translations)-end)))
 		}
 	} else {
 		content.WriteString(normalStyle.Render("  Loading translations..."))
 	}
 
-	listContent := containerStyle.Render(content.String())
-	return fmt.Sprintf("%s\n%s\n%s%s", header, listContent, help, errorMsg)
+	return containerStyle.Render(content.String())
 }
 
-func (m Model) renderCacheManager(header, help, errorMsg string) string {
+func (m Model) renderCacheManager() string {
+	bg := m.currentTheme.Background
+
 	containerStyle := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(m.currentTheme.BorderActive).
+		BorderBackground(bg).
+		Background(bg).
+		Width(56).
 		Padding(1, 2)
 
+	titleStyle := lipgloss.NewStyle().Foreground(m.currentTheme.Accent).Background(bg).Bold(true)
+	mutedStyle := lipgloss.NewStyle().Foreground(m.currentTheme.Muted).Background(bg).Italic(true)
+
 	selectedStyle := lipgloss.NewStyle().
-		Foreground(m.currentTheme.Accent).
-		Background(m.currentTheme.Highlight).
+		Foreground(bg).
+		Background(m.currentTheme.Accent).
 		Bold(true).
 		Padding(0, 1)
-
 	normalStyle := lipgloss.NewStyle().
 		Foreground(m.currentTheme.Primary).
+		Background(bg).
 		Padding(0, 1)
-
 	cachedStyle := lipgloss.NewStyle().
 		Foreground(m.currentTheme.Success).
+		Background(bg).
 		Padding(0, 1)
-
 	downloadingStyle := lipgloss.NewStyle().
 		Foreground(m.currentTheme.Warning).
+		Background(bg).
 		Padding(0, 1)
 
 	var content strings.Builder
+	content.WriteString(titleStyle.Render("Download Translations") + "\n\n")
 
 	if m.translations != nil {
-		for i, trans := range m.translations {
+		const window = 14
+		start, end := 0, len(m.translations)
+		if len(m.translations) > window {
+			start = m.cacheSelected - window/2
+			if start < 0 {
+				start = 0
+			}
+			end = start + window
+			if end > len(m.translations) {
+				end = len(m.translations)
+				start = end - window
+			}
+		}
+		if start > 0 {
+			content.WriteString(mutedStyle.Render(fmt.Sprintf("  ↑ %d more\n", start)))
+		}
+		for i := start; i < end; i++ {
+			trans := m.translations[i]
 			prefix := "  "
 			style := normalStyle
 			suffix := ""
-
-			// Check if cached
-			isCached := false
-			if m.cache != nil {
-				isCached = m.cache.IsCached(trans.ShortName)
-			}
-
-			// Check if downloading
+			isCached := m.cache != nil && m.cache.IsCached(trans.ShortName)
 			isDownloading := m.downloadingTranslation == trans.ShortName
-
 			if i == m.cacheSelected {
-				prefix = "> "
+				prefix = "▸ "
 				style = selectedStyle
 			}
-
-			name := fmt.Sprintf("%-6s - %s", trans.ShortName, trans.FullName)
-
+			name := fmt.Sprintf("%-6s · %s", trans.ShortName, trans.FullName)
 			if isDownloading {
-				suffix = " [Downloading...]"
-				style = downloadingStyle
+				suffix = "  ⟳ downloading"
+				if i != m.cacheSelected {
+					style = downloadingStyle
+				}
 			} else if isCached {
-				suffix = " [✓]"
-				if i == m.cacheSelected {
-					style = selectedStyle
-				} else {
+				suffix = "  ✓"
+				if i != m.cacheSelected {
 					style = cachedStyle
 				}
 			}
-
 			content.WriteString(style.Render(prefix+name+suffix) + "\n")
+		}
+		if end < len(m.translations) {
+			content.WriteString(mutedStyle.Render(fmt.Sprintf("  ↓ %d more", len(m.translations)-end)))
 		}
 	} else {
 		content.WriteString(normalStyle.Render("  Loading translations..."))
 	}
 
-	// Show cache size if available
+	// Live download progress bar, rendered just inside the panel below
+	// the list when a download is running. The bubbles/v2/progress bar
+	// is asked for a static view via ViewAs(p) so it doesn't animate
+	// independently of our poll-driven m.downloadProgress.
+	if m.downloadingTranslation != "" {
+		bar := m.progressBar
+		bar.SetWidth(48)
+		content.WriteString("\n\n" + mutedStyle.Render(fmt.Sprintf("Downloading %s", m.downloadingTranslation)) + "\n")
+		content.WriteString(bar.ViewAs(m.downloadProgress))
+	}
+
 	if m.cache != nil {
-		size, err := m.cache.GetCacheSize()
-		if err == nil && size > 0 {
-			sizeStr := fmt.Sprintf("\n\nCache Size: %.2f MB", float64(size)/(1024*1024))
-			content.WriteString("\n" + normalStyle.Render(sizeStr))
+		if size, err := m.cache.GetCacheSize(); err == nil && size > 0 {
+			content.WriteString("\n\n" + mutedStyle.Render(fmt.Sprintf("Cache: %.2f MB", float64(size)/(1024*1024))))
 		}
 	}
 
-	listContent := containerStyle.Render(content.String())
-	return fmt.Sprintf("%s\n%s\n%s%s", header, listContent, help, errorMsg)
+	return containerStyle.Render(content.String())
 }
 
-func (m Model) renderThemeSelect(header, help, errorMsg string) string {
+func (m Model) renderThemeSelect() string {
+	// The picker uses the CURRENTLY APPLIED theme for its own chrome
+	// (title, list, container border) so the picker keeps a stable look
+	// while the user is arrowing through options. The PREVIEW pane uses
+	// the FOCUSED theme (themes[themeSelected]) so the user can see what
+	// they'd be committing to without pressing Enter.
+	chromeBg := m.currentTheme.Background
+
+	themes := theme.AllThemes()
+	listWidth := 24
+	previewWidth := 48
+	innerW := listWidth + 1 + previewWidth // 1-cell gutter between the two halves
+
 	containerStyle := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(m.currentTheme.BorderActive).
+		BorderBackground(chromeBg).
+		Background(chromeBg).
+		Width(innerW + 4). // +2 padding +2 border
 		Padding(1, 2)
 
-	selectedStyle := lipgloss.NewStyle().
+	titleStyle := lipgloss.NewStyle().
 		Foreground(m.currentTheme.Accent).
-		Background(m.currentTheme.Highlight).
-		Bold(true).
-		Padding(0, 1)
+		Background(chromeBg).
+		Bold(true)
 
-	normalStyle := lipgloss.NewStyle().
+	// --- Left column: theme list ---
+	listSelectedStyle := lipgloss.NewStyle().
+		Foreground(chromeBg).
+		Background(m.currentTheme.Accent).
+		Bold(true)
+	listNormalStyle := lipgloss.NewStyle().
 		Foreground(m.currentTheme.Primary).
-		Padding(0, 1)
-
-	currentStyle := lipgloss.NewStyle().
+		Background(chromeBg)
+	listCurrentStyle := lipgloss.NewStyle().
 		Foreground(m.currentTheme.Success).
-		Padding(0, 1)
+		Background(chromeBg)
 
-	var content strings.Builder
-
-	themes := theme.AllThemes()
-	for i, thm := range themes {
-		prefix := "  "
-		style := normalStyle
-		suffix := ""
-
-		// Check if this is the currently active theme
-		isCurrent := thm.Name == m.currentTheme.Name
-
-		if i == m.themeSelected {
-			prefix = "> "
-			style = selectedStyle
-		} else if isCurrent {
-			style = currentStyle
+	padRow := func(s string) string {
+		w := lipgloss.Width(s)
+		if w >= listWidth {
+			return s
 		}
-
-		if isCurrent && i != m.themeSelected {
-			suffix = " [Current]"
-		}
-
-		content.WriteString(style.Render(prefix+thm.Name+suffix) + "\n")
+		return s + lipgloss.NewStyle().Background(chromeBg).Render(strings.Repeat(" ", listWidth-w))
 	}
 
-	listContent := containerStyle.Render(content.String())
-	return fmt.Sprintf("%s\n%s\n%s%s", header, listContent, help, errorMsg)
+	// Build the list as a slice of pre-padded rendered rows so we can
+	// row-pair manually with the preview without relying on lipgloss's
+	// JoinHorizontal (which has been mis-pairing rows here when the
+	// preview contains multi-row primitives like the highlight box).
+	var listRows []string
+	listRows = append(listRows, listNormalStyle.Render(padRow(titleStyle.Render("Select Theme"))))
+	listRows = append(listRows, listNormalStyle.Render(padRow("")))
+	for i, thm := range themes {
+		label := thm.Name
+		if lipgloss.Width(label) > listWidth-4 {
+			label = label[:listWidth-4]
+		}
+		isCurrent := thm.Name == m.currentTheme.Name
+		isFocused := i == m.themeSelected
+		var row string
+		switch {
+		case isFocused:
+			text := "▸ " + label
+			if isCurrent {
+				text += " ●"
+			}
+			row = listSelectedStyle.Render(padRow(text))
+		case isCurrent:
+			row = listCurrentStyle.Render(padRow("  " + label + " ●"))
+		default:
+			row = listNormalStyle.Render(padRow("  " + label))
+		}
+		listRows = append(listRows, row)
+	}
+
+	// --- Right column: live preview using the focused theme ---
+	focused := themes[m.themeSelected]
+	previewRows := strings.Split(m.themePreview(focused, previewWidth), "\n")
+	// Drop a trailing empty row that strings.Split produces when the
+	// preview ends with a newline.
+	if len(previewRows) > 0 && previewRows[len(previewRows)-1] == "" {
+		previewRows = previewRows[:len(previewRows)-1]
+	}
+
+	// Equalize heights with bg-styled blank rows.
+	listBlank := listNormalStyle.Render(padRow(""))
+	previewBlank := lipgloss.NewStyle().Background(focused.Background).Width(previewWidth).Render("")
+	for len(listRows) < len(previewRows) {
+		listRows = append(listRows, listBlank)
+	}
+	for len(previewRows) < len(listRows) {
+		previewRows = append(previewRows, previewBlank)
+	}
+
+	// Single-cell gutter in chrome bg between list and preview.
+	gutter := lipgloss.NewStyle().Background(chromeBg).Render(" ")
+
+	var body strings.Builder
+	for i := range listRows {
+		body.WriteString(listRows[i])
+		body.WriteString(gutter)
+		body.WriteString(previewRows[i])
+		if i < len(listRows)-1 {
+			body.WriteByte('\n')
+		}
+	}
+
+	return containerStyle.Render(body.String())
+}
+
+// themePreview renders a small reader-style sample in the given theme,
+// wrapped in its own rounded card so it reads as a self-contained
+// preview of how the reader would look in this theme. The card uses
+// the focused theme for border, background, and every text style.
+func (m Model) themePreview(th theme.Theme, w int) string {
+	bg := th.Background
+	hbg := th.Highlight
+
+	// The card is the full preview block, w cells wide. Its inner
+	// content area is w - 2 (border) - 4 (padding 1,2) = w - 6.
+	inner := w - 6
+	if inner < 14 {
+		inner = 14
+	}
+
+	titleStyle := lipgloss.NewStyle().Foreground(th.Accent).Background(bg).Bold(true)
+	bookStyle := lipgloss.NewStyle().Foreground(th.Success).Background(bg).Bold(true)
+	verseNumStyle := lipgloss.NewStyle().Foreground(th.Warning).Background(bg).Bold(true).Width(4).Align(lipgloss.Right)
+	textStyle := lipgloss.NewStyle().Foreground(th.Primary).Background(bg)
+	mutedStyle := lipgloss.NewStyle().Foreground(th.Muted).Background(bg).Italic(true)
+
+	hlVerseNumStyle := lipgloss.NewStyle().Foreground(th.Accent).Background(hbg).Bold(true).Width(4).Align(lipgloss.Right)
+	hlTextStyle := lipgloss.NewStyle().Foreground(th.Primary).Background(hbg).Bold(true)
+	hlBoxStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(th.BorderActive).
+		BorderBackground(bg).
+		Background(hbg).
+		Padding(0, 1)
+
+	// Pad each emitted line out to inner so the entire card interior is
+	// covered with bg cells — no chrome bleed-through.
+	pad := func(s string) string {
+		v := lipgloss.Width(s)
+		if v >= inner {
+			return s
+		}
+		return s + lipgloss.NewStyle().Background(bg).Render(strings.Repeat(" ", inner-v))
+	}
+	blank := lipgloss.NewStyle().Background(bg).Width(inner).Render("")
+
+	// Sample text widths. textWidth is the visible width of the verse
+	// text. Highlighted box outer = textWidth + 6, so we pull in by 2
+	// extra cells so it never matches inner (lipgloss wraps on exact
+	// width).
+	textWidth := inner - 8
+	if textWidth < 12 {
+		textWidth = 12
+	}
+	clip := func(s string) string {
+		if len(s) > textWidth {
+			s = s[:textWidth-1] + "…"
+		}
+		return s
+	}
+
+	var body strings.Builder
+	body.WriteString(pad(titleStyle.Render(th.Name)) + "\n")
+	body.WriteString(pad(mutedStyle.Render("preview")) + "\n")
+	body.WriteString(blank + "\n")
+	body.WriteString(pad(bookStyle.Render("John 3")) + "\n")
+	body.WriteString(blank + "\n")
+
+	sep := lipgloss.NewStyle().Background(bg).Render("  ")
+
+	v14 := textStyle.Width(textWidth).Render(clip("Moses lifted up the serpent…"))
+	body.WriteString(pad(verseNumStyle.Render("14")+sep+v14) + "\n")
+	body.WriteString(blank + "\n")
+
+	hsep := lipgloss.NewStyle().Background(hbg).Render("  ")
+	hlText := hlTextStyle.Width(textWidth - 4).Render(clip("For God so loved the world…"))
+	hlInner := hlVerseNumStyle.Render("16") + hsep + hlText
+	hl := hlBoxStyle.Render(hlInner)
+	for _, ln := range strings.Split(strings.TrimRight(hl, "\n"), "\n") {
+		body.WriteString(pad(ln) + "\n")
+	}
+	body.WriteString(blank + "\n")
+
+	v17 := textStyle.Width(textWidth).Render(clip("God did not send his Son to condemn…"))
+	body.WriteString(pad(verseNumStyle.Render("17")+sep+v17))
+
+	card := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(th.BorderActive).
+		BorderBackground(bg).
+		Background(bg).
+		Width(w - 2).
+		Padding(1, 2).
+		Render(body.String())
+
+	return card
 }
 
 func (m Model) formatChapter(verses []api.Verse, bookName string, chapter int, width int, highlightedVerseStart, highlightedVerseEnd int) string {
+	bg := m.currentTheme.Background
+	hbg := m.currentTheme.Highlight
+
 	verseStyle := lipgloss.NewStyle().
 		Foreground(m.currentTheme.Warning).
+		Background(bg).
 		Bold(true).
 		Width(4).
 		Align(lipgloss.Right)
 
 	highlightedVerseStyle := lipgloss.NewStyle().
 		Foreground(m.currentTheme.Accent).
+		Background(hbg).
 		Bold(true).
 		Width(4).
 		Align(lipgloss.Right)
 
 	textStyle := lipgloss.NewStyle().
-		Foreground(m.currentTheme.Primary)
+		Foreground(m.currentTheme.Primary).
+		Background(bg)
 
 	highlightedTextStyle := lipgloss.NewStyle().
 		Foreground(m.currentTheme.Primary).
+		Background(hbg).
 		Bold(true)
 
 	highlightedContainerStyle := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(m.currentTheme.BorderActive).
+		BorderBackground(bg).
+		Background(hbg).
 		Padding(0, 1)
+
+	// Styled separators so the gap between verse number and text gets the
+	// pane background, and the trailing blank line between verses does too.
+	sep := lipgloss.NewStyle().Background(bg).Render("  ")
+	hsep := lipgloss.NewStyle().Background(hbg).Render("  ")
+	blankLine := lipgloss.NewStyle().Background(bg).Width(width).Render("")
+	bgPadStyle := lipgloss.NewStyle().Background(bg)
+	padToWidth := func(line string) string {
+		w := lipgloss.Width(line)
+		if w >= width {
+			return line
+		}
+		return line + bgPadStyle.Render(strings.Repeat(" ", width-w))
+	}
 
 	var sb strings.Builder
 
-	// Calculate available width for text (accounting for verse number and spacing)
-	// Verse number is right-aligned in 4 chars + 2 spaces = 6 chars total
-	textWidth := width - 6
+	// Calculate available width for text. Verse number is right-aligned
+	// in 4 chars + 2 spaces = 6 chars total. We leave an extra 2 cells of
+	// safety so the highlighted-verse rounded box (which costs 6 cells of
+	// border+padding around the inner text) doesn't equal viewport width
+	// exactly (lipgloss wraps on exact-width matches).
+	textWidth := width - 8
 	if textWidth < 20 {
 		textWidth = 20 // Minimum width for readability
 	}
-	// Ensure we don't exceed actual terminal width
 	if textWidth > width-2 {
 		textWidth = width - 2
 	}
@@ -2129,15 +3467,20 @@ func (m Model) formatChapter(verses []api.Verse, bookName string, chapter int, w
 			// Apply color with width set to prevent terminal wrapping
 			verseText := highlightedTextStyle.Width(textWidth - 4).Render(wrappedText)
 
-			highlightedContent.WriteString(fmt.Sprintf("%s  %s", verseNum, verseText))
+			highlightedContent.WriteString(verseNum + hsep + verseText)
 
 			// If next verse is also highlighted, add spacing within the border
 			if nextIsHighlighted {
 				highlightedContent.WriteString("\n\n")
 			} else {
-				// End of highlighted range - render the border
+				// End of highlighted range - render the border, then pad
+				// each rendered row out to width so the right edge meets
+				// the pane background instead of the terminal default.
 				borderedVerse := highlightedContainerStyle.Render(highlightedContent.String())
-				sb.WriteString(borderedVerse + "\n\n")
+				for _, ln := range strings.Split(borderedVerse, "\n") {
+					sb.WriteString(padToWidth(ln) + "\n")
+				}
+				sb.WriteString(blankLine + "\n")
 				inHighlightedRange = false
 			}
 		} else {
@@ -2146,10 +3489,22 @@ func (m Model) formatChapter(verses []api.Verse, bookName string, chapter int, w
 			// Calculate indent for wrapped lines (verse number width + 2 spaces)
 			indent := 6
 			wrappedText := wrapTextWithIndent(text, textWidth, indent)
-			// Apply color with width set to prevent terminal wrapping
 			verseText := textStyle.Width(textWidth).Render(wrappedText)
 
-			sb.WriteString(fmt.Sprintf("%s  %s\n\n", verseNum, verseText))
+			// Each wrapped line of the verse is verseNum (4) + sep (2) +
+			// verseText (textWidth). The continuation lines already carry
+			// their leading indent inside wrappedText (from wrapTextWithIndent),
+			// so we only prepend the verse-number block on the first line.
+			// padToWidth then fills the right edge with bg for every row.
+			textLines := strings.Split(verseText, "\n")
+			for idx, ln := range textLines {
+				if idx == 0 {
+					sb.WriteString(padToWidth(verseNum+sep+ln) + "\n")
+				} else {
+					sb.WriteString(padToWidth(ln) + "\n")
+				}
+			}
+			sb.WriteString(blankLine + "\n")
 		}
 	}
 
@@ -2243,86 +3598,153 @@ func wrapTextWithIndent(text string, width int, indent int) string {
 }
 
 func (m Model) formatParallelVerses(versesMap map[string][]api.Verse, translations []string, bookName string, chapter int, width int) string {
-	translationStyle := lipgloss.NewStyle().
-		Bold(true).
-		Foreground(m.currentTheme.Accent)
+	if len(translations) == 0 {
+		return ""
+	}
 
+	bg := m.currentTheme.Background
+
+	headerStyle := lipgloss.NewStyle().
+		Foreground(m.currentTheme.Accent).
+		Background(bg).
+		Bold(true)
 	verseNumStyle := lipgloss.NewStyle().
 		Foreground(m.currentTheme.Warning).
-		Background(m.currentTheme.Background).
-		Bold(true).
-		Border(lipgloss.NormalBorder()).
-		BorderForeground(m.currentTheme.Border).
-		Padding(0, 1)
-
+		Background(bg).
+		Bold(true)
 	textStyle := lipgloss.NewStyle().
 		Foreground(m.currentTheme.Primary).
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(m.currentTheme.Border).
-		Padding(0, 1)
-
+		Background(bg)
 	separatorStyle := lipgloss.NewStyle().
-		Foreground(m.currentTheme.Border)
+		Foreground(m.currentTheme.Border).
+		Background(bg)
+	bgPad := lipgloss.NewStyle().Background(bg)
 
-	var sb strings.Builder
-
-	// Calculate available width for text (accounting for translation label)
-	textWidth := width - 15 // Reserve space for [TRANS] label and padding
-	if textWidth < 20 {
-		textWidth = 20 // Minimum width for readability
+	// Column geometry: split the available width across N translations,
+	// leaving a 1-cell gutter between each pair.
+	n := len(translations)
+	gaps := n - 1
+	colWidth := (width - gaps) / n
+	if colWidth < 20 {
+		colWidth = 20
 	}
-	// Ensure we don't exceed actual terminal width
-	if textWidth > width-2 {
-		textWidth = width - 2
+	// Inner text width allows for a "NN " verse number prefix (4 cells).
+	textWidth := colWidth - 4
+	if textWidth < 12 {
+		textWidth = 12
 	}
 
-	// Get max verses from any translation
+	// padCol pads a logical column line to colWidth using bg-styled
+	// spaces so the rows merge into a clean grid regardless of theme.
+	padCol := func(s string) string {
+		w := lipgloss.Width(s)
+		if w >= colWidth {
+			return s
+		}
+		return s + bgPad.Render(strings.Repeat(" ", colWidth-w))
+	}
+
+	// maxVerses across all translations.
 	maxVerses := 0
-	for _, verses := range versesMap {
-		if len(verses) > maxVerses {
-			maxVerses = len(verses)
+	for _, vs := range versesMap {
+		if len(vs) > maxVerses {
+			maxVerses = len(vs)
 		}
 	}
 
-	// Display verse by verse across translations
-	for i := 1; i <= maxVerses; i++ {
-		sb.WriteString(verseNumStyle.Render(fmt.Sprintf("Verse %d", i)) + "\n")
-		separatorWidth := width
-		if separatorWidth > 80 {
-			separatorWidth = 80
+	// Build the header row: one column per translation, padded to colWidth.
+	// "▾" hints that the header opens a translation picker on click.
+	headerCells := make([]string, n)
+	for j, trans := range translations {
+		label := trans + " ▾"
+		if lipgloss.Width(label) > colWidth {
+			label = label[:colWidth]
 		}
-		sb.WriteString(separatorStyle.Render(strings.Repeat("─", separatorWidth)) + "\n")
+		headerCells[j] = padCol(headerStyle.Render(label))
+	}
+	gutter := bgPad.Render(" ")
+	header := strings.Join(headerCells, gutter)
 
-		for _, trans := range translations {
-			verses, ok := versesMap[trans]
-			if !ok {
-				continue
-			}
+	// Separator row under the header.
+	sepRow := padCol(separatorStyle.Render(strings.Repeat("─", colWidth)))
+	separator := strings.Join(repeatString(sepRow, n), gutter)
 
+	// For each verse number, build a row of columns and JoinHorizontal
+	// them. JoinHorizontal automatically pads shorter columns at the
+	// bottom so all rows in a verse stay aligned.
+	var rows []string
+	rows = append(rows, header, separator)
+
+	for i := 1; i <= maxVerses; i++ {
+		cells := make([]string, n)
+		for j, trans := range translations {
+			verses := versesMap[trans]
+			var text string
 			for _, v := range verses {
 				if v.Verse == i {
-					text := stripHTMLTags(v.Text)
-					transLabelStr := fmt.Sprintf("[%s]", trans)
-					transLabel := translationStyle.Render(transLabelStr)
-
-					// Wrap text without indent since it's in a box
-					wrappedText := wrapText(text, textWidth-6) // Account for border and padding
-					verseText := textStyle.Render(transLabel + " " + wrappedText)
-					sb.WriteString(verseText + "\n\n")
+					text = stripHTMLTags(v.Text)
 					break
 				}
 			}
+			if text == "" {
+				cells[j] = padCol("")
+				continue
+			}
+			// First line: "N  text…", continuation lines indent under
+			// the text so the verse number stays as a visual anchor.
+			wrapped := wrapTextWithIndent(text, textWidth, 4)
+			lines := strings.Split(wrapped, "\n")
+			styled := make([]string, len(lines))
+			for k, ln := range lines {
+				if k == 0 {
+					styled[k] = padCol(verseNumStyle.Render(fmt.Sprintf("%-3d", i)) + bgPad.Render(" ") + textStyle.Render(ln))
+				} else {
+					styled[k] = padCol(textStyle.Render(ln))
+				}
+			}
+			cells[j] = strings.Join(styled, "\n")
 		}
-		sb.WriteString("\n")
+		rows = append(rows, lipgloss.JoinHorizontal(lipgloss.Top, intersperse(cells, gutter)...))
+		// Blank row between verses, styled in bg so it covers the full
+		// width and the grid stays painted.
+		blankRow := padCol("")
+		rows = append(rows, strings.Join(repeatString(blankRow, n), gutter))
 	}
 
-	return sb.String()
+	return strings.Join(rows, "\n")
+}
+
+func repeatString(s string, n int) []string {
+	out := make([]string, n)
+	for i := range out {
+		out[i] = s
+	}
+	return out
+}
+
+// intersperse returns ss with sep placed between each consecutive pair.
+// "a","b","c" + "|" → "a","|","b","|","c"
+func intersperse(ss []string, sep string) []string {
+	if len(ss) == 0 {
+		return ss
+	}
+	out := make([]string, 0, 2*len(ss)-1)
+	for i, s := range ss {
+		if i > 0 {
+			out = append(out, sep)
+		}
+		out = append(out, s)
+	}
+	return out
 }
 
 func stripHTMLTags(s string) string {
-	// First replace HTML tags with spaces to preserve word boundaries
+	// Strip HTML tags. The bolls.life API wraps the matched search term
+	// in <em>…</em> *inside* words (e.g. "lov<em>e</em>d"), so replacing
+	// tags with a space would split such words. Drop them outright and
+	// collapse any resulting double spaces at the end.
 	re := regexp.MustCompile(`<[^>]*>`)
-	s = re.ReplaceAllString(s, " ")
+	s = re.ReplaceAllString(s, "")
 
 	// Decode common HTML entities
 	s = strings.ReplaceAll(s, "&nbsp;", " ")
@@ -2475,293 +3897,360 @@ func fuzzyMatchBook(query string, books []api.Book) (int, string, bool) {
 	return 0, "", false
 }
 
+// parseReference accepts a wide variety of reference formats:
+//   - "John 3:16"       canonical
+//   - "john3:16"        no spaces
+//   - "john 3 16"       spaces instead of colon
+//   - "john 3:16-17"    range
+//   - "john 3 16-17"    range with spaces
+//   - "1 John 3:16"     book name starting with a digit
+//   - "1john3:16"       no spaces, book starts with digit
+//   - "1 1:1"           book by numeric id + chapter:verse
+//   - "gen 1"           book + chapter only
+//   - "gen"             book only (defaults to chapter 1)
+//
+// The split into book and the rest happens at the boundary between the
+// (optional digit-prefixed) word that names the book and the numeric
+// chapter/verse data that follows. Then any digit-runs in the rest are
+// pulled out in order as chapter / verse-start / verse-end, with a
+// hyphen interpreted as the range separator.
 func parseReference(ref string, books []api.Book) (book, chapter, verseStart, verseEnd int, err error) {
-	// Handle formats like "gal 20:2-4", "Gen 1:1", "1 1:1", "john 3:16-17"
 	ref = strings.TrimSpace(ref)
-
-	// Try to parse as "BookName Chapter:Verse-Verse" or "BookID Chapter:Verse-Verse"
-	re := regexp.MustCompile(`^([a-zA-Z0-9\s]+)\s+(\d+):(\d+)(?:-(\d+))?$`)
-	matches := re.FindStringSubmatch(ref)
-
-	if len(matches) > 0 {
-		// Extract book name/number
-		bookPart := strings.TrimSpace(matches[1])
-
-		// Try to parse as book ID first
-		bookID, parseErr := strconv.Atoi(bookPart)
-		if parseErr != nil {
-			// Not a number, try fuzzy book name match
-			if len(books) > 0 {
-				var bookName string
-				var found bool
-				bookID, bookName, found = fuzzyMatchBook(bookPart, books)
-				if !found {
-					return 0, 0, 0, 0, fmt.Errorf("book not found: %s", bookPart)
-				}
-				_ = bookName // Used for matching
-			} else {
-				return 0, 0, 0, 0, fmt.Errorf("no books loaded")
-			}
-		}
-		book = bookID
-
-		// Parse chapter
-		chapter, err = strconv.Atoi(matches[2])
-		if err != nil {
-			return 0, 0, 0, 0, fmt.Errorf("invalid chapter")
-		}
-
-		// Parse verse start
-		verseStart, err = strconv.Atoi(matches[3])
-		if err != nil {
-			return 0, 0, 0, 0, fmt.Errorf("invalid verse")
-		}
-
-		// Parse verse end (if present)
-		if len(matches) > 4 && matches[4] != "" {
-			verseEnd, err = strconv.Atoi(matches[4])
-			if err != nil {
-				verseEnd = verseStart
-			}
-		} else {
-			verseEnd = verseStart
-		}
-
-		return book, chapter, verseStart, verseEnd, nil
-	}
-
-	// Fallback to old simple numeric parser for backwards compatibility
-	parts := strings.Fields(ref)
-	if len(parts) == 0 {
+	if ref == "" {
 		return 0, 0, 0, 0, fmt.Errorf("empty reference")
 	}
 
-	// Try to parse first part as book number
-	book, err = strconv.Atoi(parts[0])
-	if err != nil {
-		// Could be book name
-		if len(books) > 0 {
-			var found bool
-			book, _, found = fuzzyMatchBook(parts[0], books)
-			if !found {
-				return 0, 0, 0, 0, fmt.Errorf("book not found: %s", parts[0])
-			}
-		} else {
-			book = 1 // Default to Genesis
+	// Book identifier alternatives, in order of specificity. Each
+	// letter run may be followed by ` letter-run` repeats so multi-word
+	// book names like "Song of Solomon" or "1 Samuel" stay intact.
+	//   1. digit + optional whitespace + letters (+ more words)  →  "1 John", "1john", "1 Samuel"
+	//   2. letters (+ more words)                                 →  "John", "rom", "Song of Solomon"
+	//   3. digit                                                  →  "1" (book id)
+	bookRe := regexp.MustCompile(`(?i)^(\d+\s*[a-z]+(?:\s+[a-z]+)*|[a-z]+(?:\s+[a-z]+)*|\d+)\s*(.*)$`)
+	m := bookRe.FindStringSubmatch(ref)
+	if m == nil {
+		return 0, 0, 0, 0, fmt.Errorf("invalid reference: %s", ref)
+	}
+	bookPart := strings.TrimSpace(m[1])
+	rest := m[2]
+
+	// Resolve the book identifier.
+	if id, perr := strconv.Atoi(bookPart); perr == nil {
+		book = id
+	} else if len(books) > 0 {
+		id, _, found := fuzzyMatchBook(bookPart, books)
+		if !found {
+			return 0, 0, 0, 0, fmt.Errorf("book not found: %s", bookPart)
 		}
+		book = id
+	} else {
+		return 0, 0, 0, 0, fmt.Errorf("no books loaded")
 	}
 
-	if len(parts) >= 2 {
-		// Parse chapter:verse or chapter:verse-verse
-		chapterVerse := parts[1]
-		cvParts := strings.Split(chapterVerse, ":")
-		chapter, err = strconv.Atoi(cvParts[0])
-		if err != nil {
-			return 0, 0, 0, 0, fmt.Errorf("invalid chapter")
+	// Default chapter when none was supplied.
+	chapter = 1
+
+	if rest == "" {
+		return book, chapter, 0, 0, nil
+	}
+
+	// Split into before/after a hyphen so verse-range parsing is robust
+	// even with arbitrary separators around it ("3:16-17", "3 16 - 17",
+	// "3 16-17").
+	beforeDash, afterDash := rest, ""
+	if i := strings.IndexByte(rest, '-'); i >= 0 {
+		beforeDash = rest[:i]
+		afterDash = rest[i+1:]
+	}
+
+	numRe := regexp.MustCompile(`\d+`)
+	beforeNums := numRe.FindAllString(beforeDash, -1)
+	afterNums := numRe.FindAllString(afterDash, -1)
+
+	if len(beforeNums) >= 1 {
+		chapter, _ = strconv.Atoi(beforeNums[0])
+	}
+	if len(beforeNums) >= 2 {
+		verseStart, _ = strconv.Atoi(beforeNums[1])
+		verseEnd = verseStart
+	}
+	if len(afterNums) >= 1 {
+		verseEnd, _ = strconv.Atoi(afterNums[0])
+		if verseStart == 0 && len(beforeNums) >= 2 {
+			verseStart, _ = strconv.Atoi(beforeNums[1])
 		}
-		if len(cvParts) > 1 {
-			// Check for verse range
-			versePart := cvParts[1]
-			if strings.Contains(versePart, "-") {
-				vRange := strings.Split(versePart, "-")
-				verseStart, _ = strconv.Atoi(vRange[0])
-				if len(vRange) > 1 {
-					verseEnd, _ = strconv.Atoi(vRange[1])
-				} else {
-					verseEnd = verseStart
-				}
-			} else {
-				verseStart, _ = strconv.Atoi(versePart)
-				verseEnd = verseStart
-			}
-		}
-	} else {
-		// Only book provided
-		chapter = 1
 	}
 
 	return book, chapter, verseStart, verseEnd, nil
 }
 
-func (m Model) renderAbout(header, help, errorMsg string) string {
+func (m Model) renderAbout() string {
+	bg := m.currentTheme.Background
+
+	width := 64
+	if m.width-leftPaneOuterWidth-6 < width {
+		width = m.width - leftPaneOuterWidth - 6
+		if width < 40 {
+			width = 40
+		}
+	}
+
 	containerStyle := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(m.currentTheme.BorderActive).
-		Padding(1, 2).
-		Width(m.width - 4)
+		BorderBackground(bg).
+		Background(bg).
+		Width(width).
+		Padding(1, 2)
 
-	titleStyle := lipgloss.NewStyle().
-		Foreground(m.currentTheme.Accent).
-		Bold(true).
-		MarginBottom(1)
-
-	sectionStyle := lipgloss.NewStyle().
-		Foreground(m.currentTheme.Primary)
-
-	labelStyle := lipgloss.NewStyle().
-		Foreground(m.currentTheme.Secondary).
-		Bold(true)
-
-	valueStyle := lipgloss.NewStyle().
-		Foreground(m.currentTheme.Primary)
-
-	linkStyle := lipgloss.NewStyle().
-		Foreground(m.currentTheme.Accent).
-		Underline(true)
+	titleStyle := lipgloss.NewStyle().Foreground(m.currentTheme.Accent).Background(bg).Bold(true)
+	sectionStyle := lipgloss.NewStyle().Foreground(m.currentTheme.Primary).Background(bg)
+	labelStyle := lipgloss.NewStyle().Foreground(m.currentTheme.Secondary).Background(bg).Bold(true)
+	valueStyle := lipgloss.NewStyle().Foreground(m.currentTheme.Primary).Background(bg)
+	linkStyle := lipgloss.NewStyle().Foreground(m.currentTheme.Accent).Background(bg).Underline(true)
 
 	var content strings.Builder
-
-	// Title
 	content.WriteString(titleStyle.Render("sword-tui") + "\n")
 	content.WriteString(sectionStyle.Render("A terminal-based Bible application") + "\n\n")
 
-	// Version info
 	content.WriteString(labelStyle.Render("Version: ") + valueStyle.Render(version.Version) + "\n")
-	content.WriteString(labelStyle.Render("Build: ") + valueStyle.Render(version.BuildNumber) + "\n\n")
+	content.WriteString(labelStyle.Render("Build:   ") + valueStyle.Render(version.BuildNumber) + "\n\n")
 
-	// Repository
-	content.WriteString(labelStyle.Render("Repository: ") + linkStyle.Render("https://github.com/kmf/sword-tui") + "\n")
-	content.WriteString(labelStyle.Render("Report Issues: ") + linkStyle.Render("https://github.com/kmf/sword-tui/issues") + "\n\n")
-
-	// API
-	content.WriteString(labelStyle.Render("API: ") + valueStyle.Render("bolls.life") + "\n")
-	content.WriteString(sectionStyle.Render("  https://bolls.life/api/") + "\n\n")
-
-	// License
+	content.WriteString(labelStyle.Render("Repo:    ") + linkStyle.Render("github.com/kmf/sword-tui") + "\n")
+	content.WriteString(labelStyle.Render("API:     ") + valueStyle.Render("bolls.life") + "\n")
 	content.WriteString(labelStyle.Render("License: ") + valueStyle.Render("GPL-2.0-or-later") + "\n\n")
 
-	// Keyboard shortcuts section
-	content.WriteString(titleStyle.Render("Keyboard Shortcuts") + "\n\n")
-
-	shortcuts := []struct {
-		key  string
-		desc string
-	}{
-		{"[", "Toggle books sidebar"},
-		{"v", "Open verse picker"},
-		{"/", "Search for verse reference"},
-		{"s", "Search Bible for word/phrase"},
-		{"c", "Compare translations"},
-		{"t", "Select translation"},
-		{"T", "Select theme"},
-		{"d", "Download translations"},
-		{"y", "Yank/copy verse"},
-		{"n / PgDn", "Next chapter"},
-		{"p / PgUp", "Previous chapter"},
-		{"?", "Show this about page"},
-		{"q", "Quit"},
+	content.WriteString(titleStyle.Render("Shortcuts") + "\n\n")
+	shortcuts := []struct{ key, desc string }{
+		{"tab", "switch focused pane"},
+		{"⏎", "open book / submit"},
+		{"n / p", "next / prev chapter"},
+		{"/", "go to verse"},
+		{"s", "search Bible"},
+		{"c", "compare translations"},
+		{"t", "select translation"},
+		{"T", "select theme"},
+		{"d", "download translations"},
+		{"y", "yank current verse"},
+		{"?", "about"},
+		{"q", "quit"},
 	}
-
 	for _, s := range shortcuts {
-		content.WriteString(labelStyle.Render(s.key) + " - " + sectionStyle.Render(s.desc) + "\n")
+		content.WriteString(labelStyle.Render(fmt.Sprintf("%-8s", s.key)) + sectionStyle.Render(s.desc) + "\n")
 	}
 
-	listContent := containerStyle.Render(content.String())
-	return fmt.Sprintf("%s\n%s\n%s%s", header, listContent, help, errorMsg)
+	return containerStyle.Render(content.String())
 }
 
-func (m Model) renderWordSearch(header, help, errorMsg string) string {
+func (m Model) renderWordSearch() string {
+	bg := m.currentTheme.Background
+
+	// Panel sizes from the available right-pane area, capped at 100 cells
+	// and floored at 40 so it stays usable on narrow terminals.
+	maxAvail := m.width - leftPaneOuterWidth - 8
+	width := maxAvail
+	if width > 100 {
+		width = 100
+	}
+	if width < 40 {
+		width = 40
+	}
+	// Inner content width: panel - border(2) - padding(2*2)
+	innerW := width - 6
+
 	containerStyle := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(m.currentTheme.BorderActive).
+		BorderBackground(bg).
+		Background(bg).
+		Width(width).
 		Padding(1, 2)
 
+	titleStyle := lipgloss.NewStyle().Foreground(m.currentTheme.Accent).Background(bg).Bold(true)
+
 	selectedStyle := lipgloss.NewStyle().
-		Foreground(m.currentTheme.Accent).
-		Background(m.currentTheme.Highlight).
-		Bold(true).
-		Padding(0, 1)
+		Foreground(bg).
+		Background(m.currentTheme.Accent).
+		Bold(true)
 
 	normalStyle := lipgloss.NewStyle().
 		Foreground(m.currentTheme.Primary).
-		Padding(0, 1)
-
-	verseNumStyle := lipgloss.NewStyle().
-		Foreground(m.currentTheme.Secondary).
-		Bold(true)
+		Background(bg)
 
 	bookNameStyle := lipgloss.NewStyle().
-		Foreground(m.currentTheme.Accent)
+		Foreground(m.currentTheme.Accent).
+		Background(bg).
+		Bold(true)
+
+	mutedStyle := lipgloss.NewStyle().Foreground(m.currentTheme.Muted).Background(bg).Italic(true)
 
 	var content strings.Builder
+	content.WriteString(titleStyle.Render("Search Bible") + "\n\n")
 
-	// Show search input if no results yet
 	if m.wordSearchResults == nil && !m.wordSearchLoading {
-		content.WriteString("Enter search term:\n\n")
-		content.WriteString(m.wordSearchInput.View())
-		content.WriteString("\n\nPress Enter to search, Esc to cancel")
+		ti := m.wordSearchInput
+		ti.SetStyles(m.themedInputStyles())
+		ti.SetWidth(innerW - 2) // leave a couple of cells of breathing room
+		content.WriteString(ti.View() + "\n\n")
+		content.WriteString(mutedStyle.Render("Type a word or phrase, then ⏎"))
 	} else if m.wordSearchLoading {
-		content.WriteString("Searching...")
+		content.WriteString(mutedStyle.Render("Searching…"))
 	} else if len(m.wordSearchResults) == 0 {
-		content.WriteString(fmt.Sprintf("No results found for \"%s\"", m.wordSearchQuery))
-		content.WriteString("\n\nPress Esc to go back")
+		content.WriteString(normalStyle.Render(fmt.Sprintf("No results for \"%s\"", m.wordSearchQuery)) + "\n\n")
+		content.WriteString(mutedStyle.Render("esc to close"))
 	} else {
-		// Show results count
-		content.WriteString(fmt.Sprintf("Found %d results for \"%s\" (showing %d)\n\n",
-			m.wordSearchTotal, m.wordSearchQuery, len(m.wordSearchResults)))
+		content.WriteString(mutedStyle.Render(fmt.Sprintf("%d results for \"%s\" — showing %d",
+			m.wordSearchTotal, m.wordSearchQuery, len(m.wordSearchResults))) + "\n\n")
 
-		// Calculate visible window for virtual scrolling
-		visibleItems := m.height - 10
-		if visibleItems < 5 {
-			visibleItems = 5
+		// Row-based virtual scrolling: each result may wrap to multiple
+		// lines, so we budget by rendered row count instead of by item.
+		// Total panel rows we can afford = m.height - top header bar (3)
+		// - status bar (3) - 2 cells of breathing room. Inside the panel
+		// we lose: border (2) + padding (2) + title (1) + blank (1) +
+		// "X results for…" (1) + blank (1) + the "↓ N more" trailer (1)
+		// = 9 rows of chrome. Anything left is for the wrapped items.
+		availRows := m.height - 3 - 3 - 2 - 9
+		if availRows < 4 {
+			availRows = 4
 		}
 
-		startIdx := 0
-		if m.wordSearchSelected >= visibleItems {
-			startIdx = m.wordSearchSelected - visibleItems + 1
+		// Pre-render each result with wrapping so we know its row cost.
+		type item struct {
+			lines   []string
+			isBook  bool
+			isSel   bool
+			origIdx int
 		}
-		endIdx := startIdx + visibleItems
-		if endIdx > len(m.wordSearchResults) {
-			endIdx = len(m.wordSearchResults)
+		var items []item
+
+		bodyPrefixW := 2 // "▸ " or "  "
+		refTemplate := "999:999 "
+		textWidth := innerW - bodyPrefixW - len(refTemplate)
+		if textWidth < 20 {
+			textWidth = 20
 		}
 
-		// Show "more above" indicator
-		if startIdx > 0 {
-			content.WriteString(fmt.Sprintf("  ... (%d more above)\n", startIdx))
-		}
-
-		// Group results by book for display
 		currentBook := -1
-		for i := startIdx; i < endIdx; i++ {
-			result := m.wordSearchResults[i]
-
-			// Show book header when book changes
+		for i, result := range m.wordSearchResults {
 			if result.Book != currentBook {
 				currentBook = result.Book
 				bookName := m.getBookName(result.Book)
-				content.WriteString("\n" + bookNameStyle.Render(bookName) + "\n")
+				items = append(items, item{
+					lines:  []string{"", bookNameStyle.Render(bookName)},
+					isBook: true,
+				})
 			}
-
-			// Format verse reference
-			ref := fmt.Sprintf("%d:%d", result.Chapter, result.Verse)
+			ref := fmt.Sprintf("%-7s", fmt.Sprintf("%d:%d", result.Chapter, result.Verse))
 			verseText := stripHTMLTags(result.Text)
+			wrapped := wrapTextWithIndent(verseText, textWidth, 2+len(refTemplate))
+			wrappedLines := strings.Split(wrapped, "\n")
 
-			// Truncate long text
-			maxLen := m.width - 20
-			if maxLen < 30 {
-				maxLen = 30
+			lines := make([]string, len(wrappedLines))
+			for j, ln := range wrappedLines {
+				var row string
+				if j == 0 {
+					row = ref + " " + ln
+				} else {
+					row = ln // continuation already has indent inside wrappedText
+				}
+				lines[j] = row
 			}
-			if len(verseText) > maxLen {
-				verseText = verseText[:maxLen-3] + "..."
-			}
+			items = append(items, item{
+				lines:   lines,
+				isSel:   i == m.wordSearchSelected,
+				origIdx: i,
+			})
+		}
 
-			line := verseNumStyle.Render(ref) + " " + verseText
-
-			if i == m.wordSearchSelected {
-				content.WriteString(selectedStyle.Render("> "+line) + "\n")
-			} else {
-				content.WriteString(normalStyle.Render("  "+line) + "\n")
+		// Find the index in `items` of the selected result so we can
+		// center the window around it.
+		selItemIdx := -1
+		for i, it := range items {
+			if !it.isBook && it.origIdx == m.wordSearchSelected {
+				selItemIdx = i
+				break
 			}
 		}
 
-		// Show "more below" indicator
-		if endIdx < len(m.wordSearchResults) {
-			content.WriteString(fmt.Sprintf("  ... (%d more below)\n", len(m.wordSearchResults)-endIdx))
+		// Walk items expanding rows around the selection until we fill
+		// availRows. Symmetric expansion keeps the cursor roughly centered.
+		startIdx, endIdx := selItemIdx, selItemIdx+1
+		if selItemIdx < 0 {
+			startIdx, endIdx = 0, 0
+		}
+		usedRows := 0
+		if selItemIdx >= 0 {
+			usedRows = len(items[selItemIdx].lines)
+		}
+		for usedRows < availRows && (startIdx > 0 || endIdx < len(items)) {
+			// Prefer expanding downward first to mimic typical list scroll.
+			if endIdx < len(items) && usedRows+len(items[endIdx].lines) <= availRows {
+				usedRows += len(items[endIdx].lines)
+				endIdx++
+			} else if startIdx > 0 && usedRows+len(items[startIdx-1].lines) <= availRows {
+				startIdx--
+				usedRows += len(items[startIdx].lines)
+			} else {
+				break
+			}
+		}
+		if startIdx < 0 {
+			startIdx = 0
+		}
+		if endIdx > len(items) {
+			endIdx = len(items)
+		}
+
+		// Count above/below results (excluding book headers).
+		var above, below int
+		for i := 0; i < startIdx; i++ {
+			if !items[i].isBook {
+				above++
+			}
+		}
+		for i := endIdx; i < len(items); i++ {
+			if !items[i].isBook {
+				below++
+			}
+		}
+
+		if above > 0 {
+			content.WriteString(mutedStyle.Render(fmt.Sprintf("  ↑ %d more", above)) + "\n")
+		}
+
+		for i := startIdx; i < endIdx; i++ {
+			it := items[i]
+			if it.isBook {
+				for _, ln := range it.lines {
+					content.WriteString(ln + "\n")
+				}
+				continue
+			}
+			for j, ln := range it.lines {
+				var styled string
+				if it.isSel {
+					if j == 0 {
+						styled = selectedStyle.Render("▸ " + ln)
+					} else {
+						styled = selectedStyle.Render("  " + ln)
+					}
+				} else {
+					if j == 0 {
+						styled = normalStyle.Render("  " + ln)
+					} else {
+						styled = normalStyle.Render("  " + ln)
+					}
+				}
+				content.WriteString(styled + "\n")
+			}
+		}
+
+		if below > 0 {
+			content.WriteString(mutedStyle.Render(fmt.Sprintf("  ↓ %d more", below)))
 		}
 	}
 
-	listContent := containerStyle.Render(content.String())
-	return fmt.Sprintf("%s\n%s\n%s%s", header, listContent, help, errorMsg)
+	return containerStyle.Render(content.String())
 }
 
 func (m Model) getBookName(bookID int) string {
