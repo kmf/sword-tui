@@ -47,6 +47,7 @@ A terminal-based Bible application built with Go, bubbletea, and lipgloss.
 ```bash
 # Install from the tap
 brew tap kmf/sword-tui
+brew trust kmf/sword-tui
 brew install sword-tui
 ```
 
