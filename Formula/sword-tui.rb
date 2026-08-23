@@ -1,29 +1,29 @@
 class SwordTui < Formula
   desc "Terminal-based Bible application built with Go"
   homepage "https://github.com/kmf/sword-tui"
-  version "1.11.0"
+  version "2.0.0"
   license "GPL-2.0-or-later"
 
   on_macos do
     if Hardware::CPU.arm?
-      url "https://github.com/kmf/sword-tui/releases/download/v1.11.0/sword-tui-darwin-arm64.tar.gz"
-      sha256 "1288b1e01be25bfe0a13db965eed8514d52bb6d058b62cdb28110ebfa1cbab73"
+      url "https://github.com/kmf/sword-tui/releases/download/v2.0.0/sword-tui-darwin-arm64.tar.gz"
+      sha256 "6974340822e49a4ad5fc68b5325caeea90610be25b61b487f427dfa487d27a6c"
     else
-      url "https://github.com/kmf/sword-tui/releases/download/v1.11.0/sword-tui-darwin-amd64.tar.gz"
-      sha256 "6639ec74c117a541b453a405654df10c5dd76e1289edbdd8a0b1e415ab2c0049"
+      url "https://github.com/kmf/sword-tui/releases/download/v2.0.0/sword-tui-darwin-amd64.tar.gz"
+      sha256 "41faab0c5241435f05183fc9b1d79a7e9b722650ac01b413d31716af566ae583"
     end
   end
 
   on_linux do
     if Hardware::CPU.arm? && Hardware::CPU.is_64_bit?
-      url "https://github.com/kmf/sword-tui/releases/download/v1.11.0/sword-tui-linux-arm64.tar.gz"
-      sha256 "ba8fea941de6e1e16a9c6bccf4e29e34e30a125f887048d1ada0f1c5da6f9162"
+      url "https://github.com/kmf/sword-tui/releases/download/v2.0.0/sword-tui-linux-arm64.tar.gz"
+      sha256 "d93296afe588372198ad5c84be6f4f7f2a9b0a08091050c7656ab8ab6ee7d04b"
     elsif Hardware::CPU.intel? && Hardware::CPU.is_64_bit?
-      url "https://github.com/kmf/sword-tui/releases/download/v1.11.0/sword-tui-linux-amd64.tar.gz"
-      sha256 "5cd8435e3a5b8278580e8cdbcf369ae34a48f32ea4bf1572781fae719480d289"
+      url "https://github.com/kmf/sword-tui/releases/download/v2.0.0/sword-tui-linux-amd64.tar.gz"
+      sha256 "47dd254b335e89da08d45398f11f921a9f6fe0e203d228518094f8f9659420c0"
     else
-      url "https://github.com/kmf/sword-tui/releases/download/v1.11.0/sword-tui-linux-i386.tar.gz"
-      sha256 "cc43918431e185aaa6d4affb2b4ecde9852eda0c97394463c912a37698eada4d"
+      url "https://github.com/kmf/sword-tui/releases/download/v2.0.0/sword-tui-linux-i386.tar.gz"
+      sha256 "cee1ea2f3534d7744e0f724ee8ab9f7d7334b469a2e1cec46375ddea85d6d681"
     end
   end
 

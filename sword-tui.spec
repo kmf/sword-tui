@@ -1,5 +1,5 @@
 Name:           sword-tui
-Version:        2.0.0
+Version:        2.0.1
 Release:        1%{?dist}
 Summary:        Terminal Bible reader built with Go and Bubbletea
 
@@ -56,6 +56,9 @@ install -Dm0644 LICENSE %{buildroot}%{_licensedir}/%{name}/LICENSE
 
 
 %changelog
+* Sun Aug 23 2026 Karl Fischer <kmf@fischer.org.za> - 2.0.1-1
+- Bump charm v2 stack (bubbletea, bubbles, lipgloss) and transitive deps
+
 * Sat Jun 06 2026 Karl Fischer <kmf@fischer.org.za> - 2.0.0-1
 - Major release: multi-pane shell on charm v2 stack
 - New: permanent two-pane layout with rounded borders and drop-shadow overlays
