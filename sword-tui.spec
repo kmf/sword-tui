@@ -11,7 +11,7 @@ Source0:        %{url}/archive/v%{version}/%{name}-%{version}.tar.gz
 # standard workflow for COPR. Disable network-isolated builds for now.
 %global debug_package %{nil}
 
-BuildRequires:  golang >= 1.21
+BuildRequires:  golang >= 1.26
 BuildRequires:  go-rpm-macros
 # Tests are visual (TUI); no automated test suite, so no Check stage.
 Requires:       glibc
